@@ -131,17 +131,17 @@ blep -r reads.fastq -R refs.fasta --header-tag "RG:Z:" -o out.tsv
 ┌─────────────────────────────────────────────────────┐
 │  CPU Thread (background)                            │
 │  ┌───────────┐   ┌──────────────┐                   │
-│  │ Read batch │──▶│ K-mer filter │──▶ PreparedBatch  │
-│  │ from disk  │   │ (optional)   │       │           │
+│  │ Read batch│──▶│ K-mer filter │──▶ PreparedBatch  │
+│  │ from disk │   │ (optional)   │       │           │
 │  └───────────┘   └──────────────┘       │           │
 └─────────────────────────────────────────┼───────────┘
                                           │ mpsc channel
 ┌─────────────────────────────────────────┼───────────┐
 │  Main Thread (GPU)                      ▼           │
-│  ┌──────────────┐   ┌───────────┐   ┌───────────┐  │
-│  │ Upload to GPU │──▶│ WFA kernel│──▶│ Download  │  │
-│  │ (sub-batches) │   │ (CUDA)   │   │ + output  │  │
-│  └──────────────┘   └───────────┘   └───────────┘  │
+│  ┌──────────────┐   ┌───────────┐   ┌───────────┐   │
+│  │ Upload to GPU│──▶│ WFA kernel│──▶│ Download  │   │
+│  │ (sub-batches)│   │ (CUDA)    │   │ + output  │   │
+│  └──────────────┘   └───────────┘   └───────────┘   │
 └─────────────────────────────────────────────────────┘
 ```
 
