@@ -83,6 +83,12 @@ struct Args {
     #[clap(long = "header-tag", num_args = 1)]
     header_tags: Vec<String>,
 
+    /// Skip output for read/reference pairs where both orientations fail the
+    /// k-mer filter. By default, failed pairs are emitted with "FAILED" in the
+    /// cigar column.
+    #[clap(long)]
+    skip_fail: bool,
+
     /// Verbosity level
     #[clap(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -455,12 +461,15 @@ fn main() -> Result<()> {
                 let rc_passed = prepared.rc_kmer_pass[global_idx];
 
                 // If neither orientation passed the k-mer filter, report FAILED
+                // (or skip entirely if --skip-fail is set)
                 if !fwd_passed && !rc_passed {
-                    let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, "FAILED", "."];
-                    for val in &tag_values {
-                        fields.push(val.as_str());
+                    if !args.skip_fail {
+                        let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, "FAILED", "."];
+                        for val in &tag_values {
+                            fields.push(val.as_str());
+                        }
+                        writer.write_record(&fields)?;
                     }
-                    writer.write_record(&fields)?;
                     continue;
                 }
 

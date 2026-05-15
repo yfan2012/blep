@@ -86,6 +86,7 @@ blep -r reads.fastq.gz -R references.fasta -o results.tsv -v
 | `-k` | `--kmer-length` | `0` (off) | K-mer length for the pre-alignment filter |
 | `-t` | `--kmer-threshold` | `0.5` | Minimum fraction of shared k-mers to proceed with alignment |
 | | `--header-tag` | — | Tag prefix to extract from read headers (repeatable) |
+| | `--skip-fail` | off | Suppress output lines for pairs that fail the k-mer filter |
 | `-v` | `--verbose` | — | Increase verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
 
 ### Output format
