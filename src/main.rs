@@ -117,6 +117,7 @@ fn main() -> Result<()> {
     info!("Starting BLEP (GPU-accelerated WFA alignment)");
     info!("Max read length: {}, Max ref length: {}, Max score: {}",
           args.max_read_length, args.max_ref_length, args.max_score);
+    info!("Reverse complement alignment: enabled (always-on)");
 
     let kmer_filter_enabled = args.kmer_length > 0;
     if kmer_filter_enabled {
@@ -128,9 +129,6 @@ fn main() -> Result<()> {
     if !header_tags.is_empty() {
         info!("Header tags to extract: {:?}", header_tags);
     }
-
-    // Pre-build k-mer sets for each reference sequence (if filter is enabled)
-    // Deferred until after references are loaded (see below).
 
     // Initialize CUDA
     let ctx = CudaContext::new(args.device)
@@ -162,7 +160,7 @@ fn main() -> Result<()> {
     // Create output writer
     let mut writer = create_writer(&args.output)?;
     {
-        let mut header_fields: Vec<&str> = vec!["read_name", "reference_name", "cigar"];
+        let mut header_fields: Vec<&str> = vec!["read_name", "reference_name", "cigar", "strand"];
         for tag in &header_tags {
             header_fields.push(tag.as_str());
         }
@@ -196,7 +194,6 @@ fn main() -> Result<()> {
           total_bytes_per_pair as f64 / 1024.0, max_gpu_pairs);
 
     // Pack and upload reference sequences to GPU (persistent across batches)
-    // Must be done before moving `references` into Arc
     let (ref_data, ref_lengths, ref_offsets) = pack_sequences(&references);
     let d_refs = stream.memcpy_stod(&ref_data)?;
     let d_ref_lengths = stream.memcpy_stod(&ref_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
@@ -204,15 +201,6 @@ fn main() -> Result<()> {
 
     // ================================================================
     // Double-buffered pipeline
-    //
-    // A background CPU thread reads the next batch and runs the k-mer
-    // pre-filter while the GPU is busy aligning the current batch.
-    //
-    //   CPU thread:  [read+filter B1] [read+filter B2] [read+filter B3] ...
-    //   GPU (main):           [align B1]       [align B2]       [align B3] ...
-    //   Output:                        [write B1]      [write B2]      ...
-    //
-    // Communication: mpsc channel sends PreparedBatch from CPU → main.
     // ================================================================
 
     info!("Starting alignment of reads from {}", args.reads.display());
@@ -226,12 +214,12 @@ fn main() -> Result<()> {
     let ref_kmer_sets_arc = Arc::new(ref_kmer_sets_owned);
 
     // Channel for sending prepared batches from CPU thread to main (GPU) thread
-    let (tx, rx) = mpsc::sync_channel::<PreparedBatch>(1); // buffer of 1 for double-buffering
+    let (tx, rx) = mpsc::sync_channel::<PreparedBatch>(1);
 
     let refs_for_thread = Arc::clone(&references_arc);
     let kmer_sets_for_thread = Arc::clone(&ref_kmer_sets_arc);
 
-    // Spawn background CPU thread: reads batches and runs k-mer pre-filter
+    // Spawn background CPU thread: reads batches, generates RC, and runs k-mer pre-filter
     let cpu_thread = thread::spawn(move || -> Result<()> {
         let mut reader = create_sequence_reader(&reads_path)?;
 
@@ -245,42 +233,89 @@ fn main() -> Result<()> {
             let num_refs = refs_for_thread.len();
             let num_pairs = num_reads * num_refs;
 
-            // Pack query sequences for GPU upload
+            // Generate reverse complement sequences for each read
+            let rc_seqs: Vec<Vec<u8>> = batch.iter()
+                .map(|rec| reverse_complement(&rec.seq))
+                .collect();
+
+            // Pack forward query sequences for GPU upload
             let (query_data, query_lengths, query_offsets) = pack_sequences(&batch);
 
-            // Run k-mer pre-filter
-            let mut kmer_pass = vec![true; num_pairs];
+            // Pack reverse complement query sequences for GPU upload
+            let (rc_query_data, rc_query_lengths, rc_query_offsets) = pack_sequences_raw(&rc_seqs);
+
+            // Run k-mer pre-filter for both orientations
+            let mut fwd_kmer_pass = vec![true; num_pairs];
+            let mut rc_kmer_pass = vec![true; num_pairs];
             let mut kmer_fail_count = 0usize;
+
             if kmer_filter_enabled {
                 for qi in 0..num_reads {
-                    let read_kmers = collect_kmers_owned(&batch[qi].seq, kmer_length);
-                    if read_kmers.is_empty() {
-                        continue;
-                    }
+                    let fwd_kmers = collect_kmers_owned(&batch[qi].seq, kmer_length);
+                    let rc_kmers = collect_kmers_owned(&rc_seqs[qi], kmer_length);
+
                     for ri in 0..num_refs {
-                        let hits = read_kmers.iter()
-                            .filter(|km| kmer_sets_for_thread[ri].contains(km.as_slice()))
-                            .count();
-                        let fraction = hits as f64 / read_kmers.len() as f64;
-                        if fraction < kmer_threshold {
-                            kmer_pass[qi * num_refs + ri] = false;
+                        let global_idx = qi * num_refs + ri;
+
+                        // Check forward orientation
+                        if !fwd_kmers.is_empty() {
+                            let hits = fwd_kmers.iter()
+                                .filter(|km| kmer_sets_for_thread[ri].contains(km.as_slice()))
+                                .count();
+                            let fraction = hits as f64 / fwd_kmers.len() as f64;
+                            if fraction < kmer_threshold {
+                                fwd_kmer_pass[global_idx] = false;
+                            }
+                        }
+
+                        // Check reverse complement orientation
+                        if !rc_kmers.is_empty() {
+                            let hits = rc_kmers.iter()
+                                .filter(|km| kmer_sets_for_thread[ri].contains(km.as_slice()))
+                                .count();
+                            let fraction = hits as f64 / rc_kmers.len() as f64;
+                            if fraction < kmer_threshold {
+                                rc_kmer_pass[global_idx] = false;
+                            }
+                        }
+
+                        // Count pairs where BOTH orientations fail
+                        if !fwd_kmer_pass[global_idx] && !rc_kmer_pass[global_idx] {
                             kmer_fail_count += 1;
                         }
                     }
                 }
             }
 
-            // Build pair indices for passing pairs
-            let mut pair_query_idx = Vec::with_capacity(num_pairs);
-            let mut pair_ref_idx = Vec::with_capacity(num_pairs);
-            let mut gpu_pair_to_global = Vec::with_capacity(num_pairs);
+            // Build pair indices for passing pairs (both orientations)
+            let mut pair_query_idx = Vec::with_capacity(num_pairs * 2);
+            let mut pair_ref_idx = Vec::with_capacity(num_pairs * 2);
+            let mut pair_is_rc = Vec::with_capacity(num_pairs * 2);
+
+            // Forward pairs
+            let mut fwd_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
             for qi in 0..num_reads {
                 for ri in 0..num_refs {
                     let global_idx = qi * num_refs + ri;
-                    if kmer_pass[global_idx] {
+                    if fwd_kmer_pass[global_idx] {
+                        fwd_gpu_idx[global_idx] = Some(pair_query_idx.len());
                         pair_query_idx.push(qi as i32);
                         pair_ref_idx.push(ri as i32);
-                        gpu_pair_to_global.push(global_idx);
+                        pair_is_rc.push(false);
+                    }
+                }
+            }
+
+            // RC pairs
+            let mut rc_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
+            for qi in 0..num_reads {
+                for ri in 0..num_refs {
+                    let global_idx = qi * num_refs + ri;
+                    if rc_kmer_pass[global_idx] {
+                        rc_gpu_idx[global_idx] = Some(pair_query_idx.len());
+                        pair_query_idx.push(qi as i32);
+                        pair_ref_idx.push(ri as i32);
+                        pair_is_rc.push(true);
                     }
                 }
             }
@@ -290,19 +325,23 @@ fn main() -> Result<()> {
                 query_data,
                 query_lengths,
                 query_offsets,
-                kmer_pass,
+                rc_query_data,
+                rc_query_lengths,
+                rc_query_offsets,
+                fwd_kmer_pass,
+                rc_kmer_pass,
                 kmer_fail_count,
                 pair_query_idx,
                 pair_ref_idx,
-                gpu_pair_to_global,
+                pair_is_rc,
+                fwd_gpu_idx,
+                rc_gpu_idx,
                 num_reads,
                 num_refs,
             };
 
-            // Send to main thread; blocks if the channel buffer is full
-            // (i.e., main thread hasn't consumed the previous batch yet)
             if tx.send(prepared).is_err() {
-                break; // main thread dropped the receiver
+                break;
             }
         }
         Ok(())
@@ -316,120 +355,91 @@ fn main() -> Result<()> {
         batch_count += 1;
         total_reads += prepared.num_reads;
         let num_refs = prepared.num_refs;
-        let num_pairs = prepared.num_reads * num_refs;
-        let num_gpu_pairs = prepared.gpu_pair_to_global.len();
+        let num_gpu_pairs = prepared.pair_query_idx.len();
 
-        info!("Processing batch {} with {} reads (total: {}), {} GPU pairs ({} filtered)",
+        info!("Processing batch {} with {} reads (total: {}), {} GPU pairs ({} both-filtered)",
               batch_count, prepared.num_reads, total_reads,
               num_gpu_pairs, prepared.kmer_fail_count);
 
-        // Upload query data to GPU
-        let d_queries = stream.memcpy_stod(&prepared.query_data)?;
-        let d_query_lengths = stream.memcpy_stod(&prepared.query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-        let d_query_offsets = stream.memcpy_stod(&prepared.query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+        // Upload forward query data to GPU
+        let d_fwd_queries = stream.memcpy_stod(&prepared.query_data)?;
+        let d_fwd_query_lengths = stream.memcpy_stod(&prepared.query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+        let d_fwd_query_offsets = stream.memcpy_stod(&prepared.query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+
+        // Upload RC query data to GPU
+        let d_rc_queries = stream.memcpy_stod(&prepared.rc_query_data)?;
+        let d_rc_query_lengths = stream.memcpy_stod(&prepared.rc_query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+        let d_rc_query_offsets = stream.memcpy_stod(&prepared.rc_query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
 
         // Collect GPU results
         let mut all_scores = vec![0i32; num_gpu_pairs];
         let mut all_cigar_ops: Vec<Vec<i8>> = vec![Vec::new(); num_gpu_pairs];
         let mut all_cigar_lengths = vec![0i32; num_gpu_pairs];
 
-        // Process pairs in GPU sub-batches to avoid OOM
-        let mut pair_offset = 0;
-        let mut sub_batch_idx = 0;
-        while pair_offset < num_gpu_pairs {
-            let sub_batch_size = std::cmp::min(max_gpu_pairs, num_gpu_pairs - pair_offset);
-            sub_batch_idx += 1;
-
-            let sub_pair_query_idx = &prepared.pair_query_idx[pair_offset..pair_offset + sub_batch_size];
-            let sub_pair_ref_idx = &prepared.pair_ref_idx[pair_offset..pair_offset + sub_batch_size];
-            let d_pair_query_idx = stream.memcpy_stod(sub_pair_query_idx)?;
-            let d_pair_ref_idx = stream.memcpy_stod(sub_pair_ref_idx)?;
-
-            let total_ws = sub_batch_size * ws_per_pair;
-            let ws_mb = (total_ws * 4) / (1024 * 1024);
-            debug!("GPU sub-batch {}: {} pairs, workspace {} MB", sub_batch_idx, sub_batch_size, ws_mb);
-
-            let mut d_workspace: CudaSlice<i32> = stream.alloc_zeros(total_ws)?;
-            let mut d_out_scores: CudaSlice<i32> = stream.alloc_zeros(sub_batch_size)?;
-            let total_cigar_bytes = sub_batch_size * max_cigar_len;
-            let mut d_out_cigars: CudaSlice<i8> = stream.alloc_zeros(total_cigar_bytes)?;
-            let mut d_out_cigar_lengths: CudaSlice<i32> = stream.alloc_zeros(sub_batch_size)?;
-
-            let block_size = 128u32;
-            let grid_size = ((sub_batch_size as u32) + block_size - 1) / block_size;
-            let cfg = LaunchConfig {
-                grid_dim: (grid_size, 1, 1),
-                block_dim: (block_size, 1, 1),
-                shared_mem_bytes: 0,
-            };
-
-            let arg_num_pairs = sub_batch_size as i32;
-            let arg_gap_open = args.gap_open;
-            let arg_gap_extend = args.gap_extend;
-            let arg_mismatch = args.mismatch;
-            let arg_max_k = max_k as i32;
-            let arg_num_diags = num_diags as i32;
-            let arg_max_score = max_score as i32;
-            let arg_max_cigar_len = max_cigar_len as i32;
-
-            let mut builder = stream.launch_builder(&kernel);
-            builder
-                .arg(&d_queries)
-                .arg(&d_query_lengths)
-                .arg(&d_query_offsets)
-                .arg(&d_refs)
-                .arg(&d_ref_lengths)
-                .arg(&d_ref_offsets)
-                .arg(&d_pair_query_idx)
-                .arg(&d_pair_ref_idx)
-                .arg(&arg_num_pairs)
-                .arg(&arg_gap_open)
-                .arg(&arg_gap_extend)
-                .arg(&arg_mismatch)
-                .arg(&arg_max_k)
-                .arg(&arg_num_diags)
-                .arg(&arg_max_score)
-                .arg(&mut d_workspace)
-                .arg(&mut d_out_scores)
-                .arg(&mut d_out_cigars)
-                .arg(&mut d_out_cigar_lengths)
-                .arg(&arg_max_cigar_len);
-
-            unsafe { builder.launch(cfg) }
-                .context("Failed to launch WFA kernel")?;
-
-            stream.synchronize().context("CUDA synchronize failed")?;
-
-            let sub_scores = stream.memcpy_dtov(&d_out_scores)?;
-            let sub_cigar_ops_raw: Vec<i8> = stream.memcpy_dtov(&d_out_cigars)?;
-            let sub_cigar_lengths = stream.memcpy_dtov(&d_out_cigar_lengths)?;
-
-            for i in 0..sub_batch_size {
-                let gpu_idx = pair_offset + i;
-                all_scores[gpu_idx] = sub_scores[i];
-                all_cigar_lengths[gpu_idx] = sub_cigar_lengths[i];
-                let cigar_len = sub_cigar_lengths[i] as usize;
-                let start = i * max_cigar_len;
-                all_cigar_ops[gpu_idx] = sub_cigar_ops_raw[start..start + cigar_len].to_vec();
+        // Split GPU pairs into forward and RC sub-groups for separate kernel launches
+        let mut fwd_pair_indices: Vec<usize> = Vec::new();
+        let mut rc_pair_indices: Vec<usize> = Vec::new();
+        for (i, &is_rc) in prepared.pair_is_rc.iter().enumerate() {
+            if is_rc {
+                rc_pair_indices.push(i);
+            } else {
+                fwd_pair_indices.push(i);
             }
-
-            pair_offset += sub_batch_size;
         }
 
-        if sub_batch_idx > 1 {
-            info!("Batch {} processed in {} GPU sub-batches", batch_count, sub_batch_idx);
+        // --- Launch forward orientation alignments ---
+        if !fwd_pair_indices.is_empty() {
+            let fwd_query_idx: Vec<i32> = fwd_pair_indices.iter()
+                .map(|&i| prepared.pair_query_idx[i])
+                .collect();
+            let fwd_ref_idx: Vec<i32> = fwd_pair_indices.iter()
+                .map(|&i| prepared.pair_ref_idx[i])
+                .collect();
+
+            let results = launch_alignment_kernel(
+                &stream, &kernel,
+                &d_fwd_queries, &d_fwd_query_lengths, &d_fwd_query_offsets,
+                &d_refs, &d_ref_lengths, &d_ref_offsets,
+                &fwd_query_idx, &fwd_ref_idx,
+                args.gap_open, args.gap_extend, args.mismatch,
+                max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
+            )?;
+
+            for (local_idx, &global_gpu_idx) in fwd_pair_indices.iter().enumerate() {
+                all_scores[global_gpu_idx] = results.scores[local_idx];
+                all_cigar_lengths[global_gpu_idx] = results.cigar_lengths[local_idx];
+                all_cigar_ops[global_gpu_idx] = results.cigar_ops[local_idx].clone();
+            }
         }
 
-        // Build reverse lookup: global_pair_idx -> gpu_pair_position
-        let mut global_to_gpu: Vec<Option<usize>> = vec![None; num_pairs];
-        for (gpu_idx, &global_idx) in prepared.gpu_pair_to_global.iter().enumerate() {
-            global_to_gpu[global_idx] = Some(gpu_idx);
+        // --- Launch reverse complement orientation alignments ---
+        if !rc_pair_indices.is_empty() {
+            let rc_query_idx: Vec<i32> = rc_pair_indices.iter()
+                .map(|&i| prepared.pair_query_idx[i])
+                .collect();
+            let rc_ref_idx: Vec<i32> = rc_pair_indices.iter()
+                .map(|&i| prepared.pair_ref_idx[i])
+                .collect();
+
+            let results = launch_alignment_kernel(
+                &stream, &kernel,
+                &d_rc_queries, &d_rc_query_lengths, &d_rc_query_offsets,
+                &d_refs, &d_ref_lengths, &d_ref_offsets,
+                &rc_query_idx, &rc_ref_idx,
+                args.gap_open, args.gap_extend, args.mismatch,
+                max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
+            )?;
+
+            for (local_idx, &global_gpu_idx) in rc_pair_indices.iter().enumerate() {
+                all_scores[global_gpu_idx] = results.scores[local_idx];
+                all_cigar_lengths[global_gpu_idx] = results.cigar_lengths[local_idx];
+                all_cigar_ops[global_gpu_idx] = results.cigar_ops[local_idx].clone();
+            }
         }
 
-        // Write output
+        // Write output: for each read×ref pair, pick the best orientation
         let mut cpu_fallback_count = 0;
         for qi in 0..prepared.num_reads {
-            // Pre-extract tag values for this read (same across all refs)
             let tag_values: Vec<String> = if !header_tags.is_empty() {
                 header_tags.iter().map(|tag| {
                     extract_tag_value(prepared.batch[qi].desc.as_deref(), tag)
@@ -441,8 +451,12 @@ fn main() -> Result<()> {
             for ri in 0..num_refs {
                 let global_idx = qi * num_refs + ri;
 
-                if !prepared.kmer_pass[global_idx] {
-                    let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, "FAILED"];
+                let fwd_passed = prepared.fwd_kmer_pass[global_idx];
+                let rc_passed = prepared.rc_kmer_pass[global_idx];
+
+                // If neither orientation passed the k-mer filter, report FAILED
+                if !fwd_passed && !rc_passed {
+                    let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, "FAILED", "."];
                     for val in &tag_values {
                         fields.push(val.as_str());
                     }
@@ -450,30 +464,86 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                let gpu_idx = global_to_gpu[global_idx]
-                    .expect("passed pair must have a GPU index");
-                let score = all_scores[gpu_idx];
-                let cigar_len = all_cigar_lengths[gpu_idx] as usize;
-
-                let cigar = if score >= 0 && cigar_len > 0 {
-                    let ops: Vec<u8> = all_cigar_ops[gpu_idx]
-                        .iter()
-                        .map(|&x| x as u8)
-                        .collect();
-                    ops_to_cigar(&ops)
+                // Get forward result (if it was aligned)
+                let fwd_result = if fwd_passed {
+                    let gpu_idx = prepared.fwd_gpu_idx[global_idx]
+                        .expect("forward-passed pair must have a GPU index");
+                    let score = all_scores[gpu_idx];
+                    let cigar_len = all_cigar_lengths[gpu_idx] as usize;
+                    if score >= 0 && cigar_len > 0 {
+                        let ops: Vec<u8> = all_cigar_ops[gpu_idx]
+                            .iter()
+                            .map(|&x| x as u8)
+                            .collect();
+                        Some((score, ops_to_cigar(&ops)))
+                    } else {
+                        cpu_fallback_count += 1;
+                        debug!("CPU fallback (fwd) for read {} vs ref {}", prepared.batch[qi].id, references_arc[ri].id);
+                        let cigar = cpu_align(
+                            &prepared.batch[qi].seq,
+                            &references_arc[ri].seq,
+                            args.gap_open,
+                            args.gap_extend,
+                            args.mismatch,
+                        );
+                        if cigar == "*" {
+                            None
+                        } else {
+                            Some((max_score as i32 + 1, cigar))
+                        }
+                    }
                 } else {
-                    cpu_fallback_count += 1;
-                    debug!("CPU fallback for read {} vs ref {}", prepared.batch[qi].id, references_arc[ri].id);
-                    cpu_align(
-                        &prepared.batch[qi].seq,
-                        &references_arc[ri].seq,
-                        args.gap_open,
-                        args.gap_extend,
-                        args.mismatch,
-                    )
+                    None
                 };
 
-                let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, &cigar];
+                // Get RC result (if it was aligned)
+                let rc_result = if rc_passed {
+                    let gpu_idx = prepared.rc_gpu_idx[global_idx]
+                        .expect("rc-passed pair must have a GPU index");
+                    let score = all_scores[gpu_idx];
+                    let cigar_len = all_cigar_lengths[gpu_idx] as usize;
+                    if score >= 0 && cigar_len > 0 {
+                        let ops: Vec<u8> = all_cigar_ops[gpu_idx]
+                            .iter()
+                            .map(|&x| x as u8)
+                            .collect();
+                        Some((score, ops_to_cigar(&ops)))
+                    } else {
+                        cpu_fallback_count += 1;
+                        debug!("CPU fallback (rc) for read {} vs ref {}", prepared.batch[qi].id, references_arc[ri].id);
+                        let rc_seq = reverse_complement(&prepared.batch[qi].seq);
+                        let cigar = cpu_align(
+                            &rc_seq,
+                            &references_arc[ri].seq,
+                            args.gap_open,
+                            args.gap_extend,
+                            args.mismatch,
+                        );
+                        if cigar == "*" {
+                            None
+                        } else {
+                            Some((max_score as i32 + 1, cigar))
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Pick the best orientation (lower score = better alignment)
+                let (cigar, strand) = match (fwd_result, rc_result) {
+                    (None, None) => ("*".to_string(), "."),
+                    (Some((_score, cigar)), None) => (cigar, "+"),
+                    (None, Some((_score, cigar))) => (cigar, "-"),
+                    (Some((fwd_score, fwd_cigar)), Some((rc_score, rc_cigar))) => {
+                        if fwd_score <= rc_score {
+                            (fwd_cigar, "+")
+                        } else {
+                            (rc_cigar, "-")
+                        }
+                    }
+                };
+
+                let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, &cigar, strand];
                 for val in &tag_values {
                     fields.push(val.as_str());
                 }
@@ -482,7 +552,7 @@ fn main() -> Result<()> {
         }
 
         if cpu_fallback_count > 0 {
-            info!("CPU fallback used for {} / {} pairs in batch {}", cpu_fallback_count, num_gpu_pairs, batch_count);
+            info!("CPU fallback used for {} pairs in batch {}", cpu_fallback_count, batch_count);
         }
     }
 
@@ -502,13 +572,163 @@ struct PreparedBatch {
     query_data: Vec<i8>,
     query_lengths: Vec<usize>,
     query_offsets: Vec<usize>,
-    kmer_pass: Vec<bool>,
+    rc_query_data: Vec<i8>,
+    rc_query_lengths: Vec<usize>,
+    rc_query_offsets: Vec<usize>,
+    fwd_kmer_pass: Vec<bool>,
+    rc_kmer_pass: Vec<bool>,
     kmer_fail_count: usize,
     pair_query_idx: Vec<i32>,
     pair_ref_idx: Vec<i32>,
-    gpu_pair_to_global: Vec<usize>,
+    pair_is_rc: Vec<bool>,
+    fwd_gpu_idx: Vec<Option<usize>>,
+    rc_gpu_idx: Vec<Option<usize>>,
     num_reads: usize,
     num_refs: usize,
+}
+
+/// Results from a GPU kernel launch
+struct KernelResults {
+    scores: Vec<i32>,
+    cigar_ops: Vec<Vec<i8>>,
+    cigar_lengths: Vec<i32>,
+}
+
+/// Launch the WFA alignment kernel for a set of pairs, handling sub-batching for GPU memory.
+fn launch_alignment_kernel(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    d_queries: &CudaSlice<i8>,
+    d_query_lengths: &CudaSlice<i32>,
+    d_query_offsets: &CudaSlice<i32>,
+    d_refs: &CudaSlice<i8>,
+    d_ref_lengths: &CudaSlice<i32>,
+    d_ref_offsets: &CudaSlice<i32>,
+    pair_query_idx: &[i32],
+    pair_ref_idx: &[i32],
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+    max_k: usize,
+    num_diags: usize,
+    max_score: usize,
+    max_cigar_len: usize,
+    max_gpu_pairs: usize,
+) -> Result<KernelResults> {
+    let num_pairs = pair_query_idx.len();
+    let ws_per_pair = 4 * (max_score + 1) * num_diags;
+
+    let mut all_scores = vec![0i32; num_pairs];
+    let mut all_cigar_ops: Vec<Vec<i8>> = vec![Vec::new(); num_pairs];
+    let mut all_cigar_lengths = vec![0i32; num_pairs];
+
+    let mut pair_offset = 0;
+    let mut sub_batch_idx = 0;
+    while pair_offset < num_pairs {
+        let sub_batch_size = std::cmp::min(max_gpu_pairs, num_pairs - pair_offset);
+        sub_batch_idx += 1;
+
+        let sub_pair_query_idx = &pair_query_idx[pair_offset..pair_offset + sub_batch_size];
+        let sub_pair_ref_idx = &pair_ref_idx[pair_offset..pair_offset + sub_batch_size];
+        let d_pair_query_idx = stream.memcpy_stod(sub_pair_query_idx)?;
+        let d_pair_ref_idx = stream.memcpy_stod(sub_pair_ref_idx)?;
+
+        let total_ws = sub_batch_size * ws_per_pair;
+        let ws_mb = (total_ws * 4) / (1024 * 1024);
+        debug!("GPU sub-batch {}: {} pairs, workspace {} MB", sub_batch_idx, sub_batch_size, ws_mb);
+
+        let mut d_workspace: CudaSlice<i32> = stream.alloc_zeros(total_ws)?;
+        let mut d_out_scores: CudaSlice<i32> = stream.alloc_zeros(sub_batch_size)?;
+        let total_cigar_bytes = sub_batch_size * max_cigar_len;
+        let mut d_out_cigars: CudaSlice<i8> = stream.alloc_zeros(total_cigar_bytes)?;
+        let mut d_out_cigar_lengths: CudaSlice<i32> = stream.alloc_zeros(sub_batch_size)?;
+
+        let block_size = 128u32;
+        let grid_size = ((sub_batch_size as u32) + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let arg_num_pairs = sub_batch_size as i32;
+        let arg_gap_open = gap_open;
+        let arg_gap_extend = gap_extend;
+        let arg_mismatch = mismatch;
+        let arg_max_k = max_k as i32;
+        let arg_num_diags = num_diags as i32;
+        let arg_max_score = max_score as i32;
+        let arg_max_cigar_len = max_cigar_len as i32;
+
+        let mut builder = stream.launch_builder(kernel);
+        builder
+            .arg(d_queries)
+            .arg(d_query_lengths)
+            .arg(d_query_offsets)
+            .arg(d_refs)
+            .arg(d_ref_lengths)
+            .arg(d_ref_offsets)
+            .arg(&d_pair_query_idx)
+            .arg(&d_pair_ref_idx)
+            .arg(&arg_num_pairs)
+            .arg(&arg_gap_open)
+            .arg(&arg_gap_extend)
+            .arg(&arg_mismatch)
+            .arg(&arg_max_k)
+            .arg(&arg_num_diags)
+            .arg(&arg_max_score)
+            .arg(&mut d_workspace)
+            .arg(&mut d_out_scores)
+            .arg(&mut d_out_cigars)
+            .arg(&mut d_out_cigar_lengths)
+            .arg(&arg_max_cigar_len);
+
+        unsafe { builder.launch(cfg) }
+            .context("Failed to launch WFA kernel")?;
+
+        stream.synchronize().context("CUDA synchronize failed")?;
+
+        let sub_scores = stream.memcpy_dtov(&d_out_scores)?;
+        let sub_cigar_ops_raw: Vec<i8> = stream.memcpy_dtov(&d_out_cigars)?;
+        let sub_cigar_lengths = stream.memcpy_dtov(&d_out_cigar_lengths)?;
+
+        for i in 0..sub_batch_size {
+            let idx = pair_offset + i;
+            all_scores[idx] = sub_scores[i];
+            all_cigar_lengths[idx] = sub_cigar_lengths[i];
+            let cigar_len = sub_cigar_lengths[i] as usize;
+            let start = i * max_cigar_len;
+            all_cigar_ops[idx] = sub_cigar_ops_raw[start..start + cigar_len].to_vec();
+        }
+
+        pair_offset += sub_batch_size;
+    }
+
+    if sub_batch_idx > 1 {
+        debug!("Processed in {} GPU sub-batches", sub_batch_idx);
+    }
+
+    Ok(KernelResults {
+        scores: all_scores,
+        cigar_ops: all_cigar_ops,
+        cigar_lengths: all_cigar_lengths,
+    })
+}
+
+// ============================================================
+// Reverse complement
+// ============================================================
+
+/// Compute the reverse complement of a DNA sequence.
+fn reverse_complement(seq: &[u8]) -> Vec<u8> {
+    seq.iter().rev().map(|&b| match b {
+        b'A' | b'a' => b'T',
+        b'T' | b't' => b'A',
+        b'C' | b'c' => b'G',
+        b'G' | b'g' => b'C',
+        b'N' | b'n' => b'N',
+        _ => b'N',
+    }).collect()
 }
 
 // ============================================================
@@ -561,7 +781,6 @@ fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mis
     let mut wf_m: HashMap<(i32, i32), i32> = HashMap::new();
     let mut wf_i: HashMap<(i32, i32), i32> = HashMap::new();
     let mut wf_d: HashMap<(i32, i32), i32> = HashMap::new();
-    // bt: (score, k) -> (prev_score, prev_k, op, src_comp)
     let mut bt: HashMap<(i32, i32), (i32, i32, u8, u8)> = HashMap::new();
 
     wf_m.insert((0, 0), 0);
@@ -584,7 +803,7 @@ fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mis
     let mut final_score = -1i32;
 
     for s in 1..=4096i32 {
-        // Insertions (k+1, offset stays)
+        // Insertions
         let ins_s = s - gap_open - gap_extend;
         if ins_s >= 0 {
             let entries: Vec<_> = wf_m.iter()
@@ -610,7 +829,7 @@ fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mis
             }
         }
 
-        // Deletions (k-1, offset+1)
+        // Deletions
         let del_s = s - gap_open - gap_extend;
         if del_s >= 0 {
             let entries: Vec<_> = wf_m.iter()
@@ -662,7 +881,6 @@ fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mis
         for (k, off) in i_entries {
             if off > wf_m.get(&(s, k)).copied().unwrap_or(-1) {
                 wf_m.insert((s, k), off);
-                // Find source for backtrack
                 let prev_k = k - 1;
                 let ins_s = s - gap_open - gap_extend;
                 let ins_ext_s = s - gap_extend;
@@ -671,7 +889,7 @@ fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mis
                 } else if ins_ext_s >= 0 && wf_i.get(&(ins_ext_s, prev_k)).copied().unwrap_or(-1) == off {
                     bt.insert((s, k), (ins_ext_s, prev_k, OP_INSERTION, 1));
                 } else {
-                    bt.insert((s, k), (s, k, OP_INSERTION, 0)); // fallback
+                    bt.insert((s, k), (s, k, OP_INSERTION, 0));
                 }
             }
         }
@@ -764,14 +982,6 @@ fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mis
 // Header tag extraction
 // ============================================================
 
-/// Extract the value of a tag from a read header description string.
-///
-/// The description is the portion of the header line after the first whitespace
-/// (i.e., everything after the read ID). Tags are whitespace-delimited tokens
-/// that start with the given prefix (e.g. `"RG:Z:"`). The value is the
-/// remainder of that token after the prefix.
-///
-/// Returns an empty string if the tag is not found or the description is `None`.
 fn extract_tag_value(desc: Option<&str>, tag_prefix: &str) -> String {
     match desc {
         Some(d) => {
@@ -819,8 +1029,23 @@ fn pack_sequences(records: &[SequenceRecord]) -> (Vec<i8>, Vec<usize>, Vec<usize
     (data, lengths, offsets)
 }
 
+/// Pack raw byte sequences (e.g., reverse complements) for GPU transfer.
+fn pack_sequences_raw(seqs: &[Vec<u8>]) -> (Vec<i8>, Vec<usize>, Vec<usize>) {
+    let mut data = Vec::new();
+    let mut lengths = Vec::new();
+    let mut offsets = Vec::new();
+    for seq in seqs {
+        offsets.push(data.len());
+        lengths.push(seq.len());
+        for &b in seq {
+            data.push(b as i8);
+        }
+    }
+    (data, lengths, offsets)
+}
+
 // ============================================================
-// File I/O (same as mlem)
+// File I/O
 // ============================================================
 
 fn detect_format(path: &PathBuf) -> Result<SequenceFormat> {

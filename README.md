@@ -9,9 +9,10 @@ The code in this repo was written by an AI assistant (claude opus) under guidanc
 ## Features
 
 - **CUDA-accelerated WFA alignment** — each query×reference pair is aligned by a dedicated GPU thread, enabling massive parallelism
+- **Strand-aware alignment** — every read is automatically aligned in both forward and reverse complement orientations; only the best-scoring alignment is reported with a strand indicator (`+`/`-`)
 - **Affine gap penalties** — configurable mismatch, gap-open, and gap-extension costs
 - **FASTA & FASTQ input** — auto-detected format, with transparent gzip/bzip2/xz decompression via [niffler](https://crates.io/crates/niffler)
-- **K-mer pre-filter** — optional k-mer overlap check skips unlikely alignments before they reach the GPU, saving compute
+- **K-mer pre-filter** — optional k-mer overlap check skips unlikely alignments before they reach the GPU, saving compute (applied independently to both orientations)
 - **Double-buffered pipeline** — a background CPU thread reads and pre-filters the next batch while the GPU aligns the current one
 - **Automatic GPU memory management** — queries available VRAM and splits work into sub-batches to avoid out-of-memory errors
 - **CPU fallback** — pairs that exceed the GPU score budget are transparently re-aligned on the CPU
@@ -92,10 +93,11 @@ blep -r reads.fastq.gz -R references.fasta -o results.tsv -v
 Tab-separated values with columns:
 
 ```
-read_name    reference_name    cigar    [tag_values...]
+read_name    reference_name    cigar    strand    [tag_values...]
 ```
 
-- **cigar** — Extended CIGAR string (`=` match, `X` mismatch, `I` insertion, `D` deletion), or `FAILED` if the k-mer pre-filter rejected the pair, or `*` if alignment could not be computed.
+- **cigar** — Extended CIGAR string (`=` match, `X` mismatch, `I` insertion, `D` deletion), or `FAILED` if the k-mer pre-filter rejected the pair in both orientations, or `*` if alignment could not be computed.
+- **strand** — `+` if the best alignment is on the forward strand, `-` if the reverse complement produced a better score, or `.` if the pair was filtered/failed.
 
 ### Examples
 
@@ -112,7 +114,6 @@ blep -r reads.fastq.gz -R refs.fasta -k 15 -t 0.3 -o out.tsv -v
 ```
 
 Custom penalties and larger score budget:
-
 ```bash
 blep -r reads.fq -R refs.fa -g 4 -e 2 -m 6 --max-score 512 -o out.tsv
 ```
@@ -128,24 +129,36 @@ blep -r reads.fastq -R refs.fasta --header-tag "RG:Z:" -o out.tsv
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  CPU Thread (background)                            │
-│  ┌───────────┐   ┌──────────────┐                   │
-│  │ Read batch│──▶│ K-mer filter │──▶ PreparedBatch  │
-│  │ from disk │   │ (optional)   │       │           │
-│  └───────────┘   └──────────────┘       │           │
-└─────────────────────────────────────────┼───────────┘
-                                          │ mpsc channel
-┌─────────────────────────────────────────┼───────────┐
-│  Main Thread (GPU)                      ▼           │
-│  ┌──────────────┐   ┌───────────┐   ┌───────────┐   │
-│  │ Upload to GPU│──▶│ WFA kernel│──▶│ Download  │   │
-│  │ (sub-batches)│   │ (CUDA)    │   │ + output  │   │
-│  └──────────────┘   └───────────┘   └───────────┘   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  CPU Thread (background)                                     │
+│  ┌───────────┐   ┌────────────┐   ┌──────────────┐           │
+│  │ Read batch│──▶│ Generate   │──▶│ K-mer filter │──▶ Batch  │
+│  │ from disk │   │ rev. comp. │   │ (fwd + RC)   │     │     │
+│  └───────────┘   └────────────┘   └──────────────┘     │     │
+└────────────────────────────────────────────────────────┼─────┘
+                                                         │ mpsc
+┌────────────────────────────────────────────────────────┼─────┐
+│  Main Thread (GPU)                                     ▼     │
+│  ┌──────────────┐   ┌───────────┐   ┌───────────┐   ┌─────┐  │
+│  │ Upload to GPU│──▶│ WFA kernel│──▶│ Download  │──▶│Best │  │
+│  │ (fwd + RC)   │   │ (CUDA)    │   │ results   │   │score│  │
+│  └──────────────┘   └───────────┘   └───────────┘   └─────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 The pipeline is **double-buffered**: while the GPU processes batch *N*, the CPU thread is already reading and filtering batch *N+1*. Communication uses a bounded `mpsc::sync_channel(1)`.
+
+### Reverse complement alignment
+
+Every read is aligned against each reference in **both orientations** (forward and reverse complement). The best-scoring alignment is reported along with a strand indicator (`+` or `-`). This is always-on and requires no additional flags.
+
+When the k-mer pre-filter is enabled, it is applied independently to each orientation:
+- If only the forward orientation passes → only forward is aligned, reported as `+`
+- If only the reverse complement passes → only RC is aligned, reported as `-`
+- If both pass → both are aligned on GPU, the lower score wins
+- If neither passes → the pair is reported as `FAILED` with strand `.`
+
+This approach ensures that reverse-strand reads are correctly identified without requiring external pre-processing, while the k-mer filter still provides speedup by skipping unlikely orientation×reference combinations.
 
 ### CUDA kernel
 
