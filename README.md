@@ -9,6 +9,7 @@ The code in this repo was written by an AI assistant (claude opus) under guidanc
 ## Features
 
 - **CUDA-accelerated WFA alignment** — each query×reference pair is aligned by a dedicated GPU thread, enabling massive parallelism
+- **Multi-GPU support** — batches are distributed across all available GPUs (or an explicit `--devices` list), each driven by its own worker thread for near-linear scaling
 - **Strand-aware alignment** — every read is automatically aligned in both forward and reverse complement orientations; only the best-scoring alignment is reported with a strand indicator (`+`/`-`)
 - **Affine gap penalties** — configurable mismatch, gap-open, and gap-extension costs
 - **FASTA & FASTQ input** — auto-detected format, with transparent gzip/bzip2/xz decompression via [niffler](https://crates.io/crates/niffler)
@@ -82,7 +83,7 @@ blep -r reads.fastq.gz -R references.fasta -o results.tsv -v
 | | `--max-read-length` | `500` | Maximum read length (for GPU memory pre-allocation) |
 | | `--max-ref-length` | `500` | Maximum reference length (for GPU memory pre-allocation) |
 | | `--max-score` | `256` | Score budget on GPU; pairs exceeding this fall back to CPU |
-| | `--device` | `0` | CUDA device index |
+| | `--devices` | all GPUs | Comma-separated CUDA device indices to use (e.g. `0,1,2`); defaults to every available device |
 | `-k` | `--kmer-length` | `0` (off) | K-mer length for the pre-alignment filter |
 | `-t` | `--kmer-threshold` | `0.5` | Minimum fraction of shared k-mers to proceed with alignment |
 | | `--header-tag` | — | Tag prefix to extract from read headers (repeatable) |
@@ -131,23 +132,30 @@ blep -r reads.fastq -R refs.fasta --header-tag "RG:Z:" -o out.tsv
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  CPU Thread (background)                                     │
-│  ┌───────────┐   ┌────────────┐   ┌──────────────┐           │
-│  │ Read batch│──▶│ Generate   │──▶│ K-mer filter │──▶ Batch  │
-│  │ from disk │   │ rev. comp. │   │ (fwd + RC)   │     │     │
-│  └───────────┘   └────────────┘   └──────────────┘     │     │
-└────────────────────────────────────────────────────────┼─────┘
-                                                         │ mpsc
-┌────────────────────────────────────────────────────────┼─────┐
-│  Main Thread (GPU)                                     ▼     │
-│  ┌──────────────┐   ┌───────────┐   ┌───────────┐   ┌─────┐  │
-│  │ Upload to GPU│──▶│ WFA kernel│──▶│ Download  │──▶│Best │  │
-│  │ (fwd + RC)   │   │ (CUDA)    │   │ results   │   │score│  │
-│  └──────────────┘   └───────────┘   └───────────┘   └─────┘  │
-└──────────────────────────────────────────────────────────────┘
+│  CPU Reader Thread (background)                                │
+│  ┌───────────┐   ┌────────────┐   ┌──────────────┐            │
+│  │ Read batch│──▶│ Generate   │──▶│ K-mer filter │──▶ Batch   │
+│  │ from disk │   │ rev. comp. │   │ (fwd + RC)   │      │      │
+│  └───────────┘   └────────────┘   └──────────────┘      │      │
+└─────────────────────────────────────────────────────────┼──────┘
+                                                          │ shared queue
+                                        ┌─────────────────┼─────────────────┐
+                                        ▼                 ▼                 ▼
+                              ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+                              │ GPU Worker 0 │  │ GPU Worker 1 │  │ GPU Worker N │
+                              │ upload→WFA→  │  │ upload→WFA→  │  │ upload→WFA→  │
+                              │ download→best│  │ download→best│  │ download→best│
+                              └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+                                     └─────────────────┼─────────────────┘
+                                                       ▼
+                                          ┌─────────────────────────┐
+                                          │ TSV writer (mutex-guarded)│
+                                          └─────────────────────────┘
 ```
 
-The pipeline is **double-buffered**: while the GPU processes batch *N*, the CPU thread is already reading and filtering batch *N+1*. Communication uses a bounded `mpsc::sync_channel(1)`.
+The pipeline is **pipelined and data-parallel**: a single background CPU thread reads, reverse-complements, and k-mer-filters batches, then hands each prepared batch to whichever GPU worker is free. Each worker owns its own CUDA context, kernel module, and reference copy, and processes an entire batch independently. Communication uses a bounded `mpsc::sync_channel(num_devices * 2)` whose receiver is shared across workers behind a `Mutex` (an MPMC queue built on std's MPSC).
+
+**Output ordering:** each batch's rows are written under a single lock acquisition, so all rows for a given read stay contiguous. However, because batches finish on whichever GPU is free first, the relative order of batches in the output is not guaranteed to match the input order when more than one device is used. Sort downstream if a stable order is required.
 
 ### Reverse complement alignment
 
@@ -180,7 +188,7 @@ The kernel is compiled to PTX by `nvcc` at build time (via [`build.rs`](build.rs
 
 ### GPU memory management
 
-Before launching kernels, blep queries available VRAM with `cudarc::driver::result::mem_get_info()` and computes the per-pair memory footprint. It uses 75% of free memory and automatically splits large batches into sub-batches that fit within the budget.
+Before launching kernels, each GPU worker queries its own device's available VRAM with `cudarc::driver::result::mem_get_info()` and computes the per-pair memory footprint. It uses 75% of free memory and automatically splits large batches into sub-batches that fit within the budget. Because sizing is per-device, GPUs with differing amounts of free memory are each used to their own capacity.
 
 ### CPU fallback
 

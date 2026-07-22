@@ -4,7 +4,7 @@ use std::io::{self, Read, BufReader};
 use std::collections::HashSet;
 use std::sync::mpsc;
 use std::thread;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, Context, anyhow};
 use clap::Parser;
@@ -61,9 +61,11 @@ struct Args {
     #[clap(long, default_value = "256")]
     max_score: usize,
 
-    /// CUDA device index
-    #[clap(long, default_value = "0")]
-    device: usize,
+    /// Comma-separated list of CUDA device indices to use (e.g. "0,1,2").
+    /// If omitted, all available CUDA devices are used. Each device runs in its
+    /// own worker thread and processes batches in parallel.
+    #[clap(long, value_delimiter = ',')]
+    devices: Option<Vec<usize>>,
 
     /// K-mer length for the pre-alignment filter. When set (> 0), unique k-mers
     /// of the read are checked against the reference before running WFA.
@@ -136,22 +138,27 @@ fn main() -> Result<()> {
         info!("Header tags to extract: {:?}", header_tags);
     }
 
-    // Initialize CUDA
-    let ctx = CudaContext::new(args.device)
-        .context("Failed to initialize CUDA device")?;
-    let stream = ctx.default_stream();
-    info!("CUDA device {} initialized", args.device);
+    // Determine which CUDA devices to use: an explicit --devices list, or every
+    // available device when the flag is omitted.
+    let device_ids: Vec<usize> = match &args.devices {
+        Some(list) if !list.is_empty() => list.clone(),
+        _ => {
+            let count = CudaContext::device_count()
+                .context("Failed to query CUDA device count")?;
+            if count <= 0 {
+                return Err(anyhow!("No CUDA devices available"));
+            }
+            (0..count as usize).collect()
+        }
+    };
+    let num_devices = device_ids.len();
+    info!("Using {} CUDA device(s): {:?}", num_devices, device_ids);
 
-    // Load PTX kernel (compiled at build time by build.rs)
-    let ptx_src = include_str!(env!("WFA_PTX_PATH"));
-    let ptx = Ptx::from_src(ptx_src);
-    let module = ctx.load_module(ptx)
-        .context("Failed to load WFA PTX module")?;
-    let kernel = module.load_function("wfa_align_kernel")
-        .context("Failed to load wfa_align_kernel function")?;
-    info!("WFA kernel loaded");
+    // PTX kernel source (compiled at build time by build.rs). This is a
+    // &'static str; each worker loads it into a module on its own device.
+    let ptx_src: &'static str = include_str!(env!("WFA_PTX_PATH"));
 
-    // Read reference sequences
+    // Read reference sequences (shared read-only across all GPU workers).
     info!("Reading reference sequences from {}", args.references.display());
     let references = read_sequences_fully(&args.references)?;
     info!("Loaded {} reference sequences", references.len());
@@ -163,7 +170,14 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
-    // Create output writer
+    // Pack reference sequences once on the host; each worker uploads its own
+    // copy to its device. Shared across worker threads via Arc.
+    let (ref_data, ref_lengths, ref_offsets) = pack_sequences(&references);
+    let ref_data = Arc::new(ref_data);
+    let ref_lengths = Arc::new(ref_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>());
+    let ref_offsets = Arc::new(ref_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>());
+
+    // Create output writer, shared across worker threads behind a mutex.
     let mut writer = create_writer(&args.output)?;
     {
         let mut header_fields: Vec<&str> = vec!["read_name", "reference_name", "cigar", "strand"];
@@ -172,46 +186,29 @@ fn main() -> Result<()> {
         }
         writer.write_record(&header_fields)?;
     }
+    let writer = Arc::new(Mutex::new(writer));
 
-    // Pre-compute GPU parameters
+    // Pre-compute GPU parameters (identical across devices)
     let max_k = std::cmp::max(args.max_read_length, args.max_ref_length);
     let num_diags = 2 * max_k + 1;
     let max_score = args.max_score;
     let max_cigar_len = args.max_read_length + args.max_ref_length;
 
-    // Calculate per-pair GPU memory requirements and determine max pairs per GPU sub-batch
+    // Per-pair GPU memory footprint. Each worker combines this with its own
+    // device's free memory to size sub-batches.
     let ws_per_pair = 4 * (max_score + 1) * num_diags; // ints for workspace
     let ws_bytes_per_pair = ws_per_pair * 4; // 4 bytes per i32
     let cigar_bytes_per_pair = max_cigar_len; // 1 byte per i8
     let output_bytes_per_pair = 4 + cigar_bytes_per_pair + 4; // score(i32) + cigar(i8s) + cigar_len(i32)
     let total_bytes_per_pair = ws_bytes_per_pair + output_bytes_per_pair;
 
-    // Query available GPU memory and use 75% of free memory for workspace
-    let (free_mem, total_mem) = cudarc::driver::result::mem_get_info()
-        .context("Failed to query GPU memory")?;
-    let usable_mem = (free_mem as f64 * 0.75) as usize;
-    let max_gpu_pairs = if total_bytes_per_pair > 0 {
-        std::cmp::max(1, usable_mem / total_bytes_per_pair)
-    } else {
-        args.batch_size
-    };
-    info!("GPU memory: {:.0} MB free / {:.0} MB total, {:.1} KB/pair, max {} pairs per GPU sub-batch",
-          free_mem as f64 / 1048576.0, total_mem as f64 / 1048576.0,
-          total_bytes_per_pair as f64 / 1024.0, max_gpu_pairs);
-
-    // Pack and upload reference sequences to GPU (persistent across batches)
-    let (ref_data, ref_lengths, ref_offsets) = pack_sequences(&references);
-    let d_refs = stream.memcpy_stod(&ref_data)?;
-    let d_ref_lengths = stream.memcpy_stod(&ref_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-    let d_ref_offsets = stream.memcpy_stod(&ref_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-
     // ================================================================
-    // Double-buffered pipeline
+    // Multi-GPU pipeline: one CPU reader thread feeds N GPU worker threads
     // ================================================================
 
     info!("Starting alignment of reads from {}", args.reads.display());
 
-    // Wrap shared data in Arc for the background thread
+    // Shared, immutable inputs for the background reader thread.
     let reads_path = args.reads.clone();
     let batch_size = args.batch_size;
     let kmer_length = args.kmer_length;
@@ -219,8 +216,12 @@ fn main() -> Result<()> {
     let references_arc = Arc::new(references);
     let ref_kmer_sets_arc = Arc::new(ref_kmer_sets_owned);
 
-    // Channel for sending prepared batches from CPU thread to main (GPU) thread
-    let (tx, rx) = mpsc::sync_channel::<PreparedBatch>(1);
+    // Channel for sending prepared batches from the CPU thread to the GPU
+    // workers. Capacity scales with the device count so all GPUs stay fed.
+    // Wrapping the receiver in a mutex turns std's MPSC into an MPMC queue that
+    // the worker threads can share.
+    let (tx, rx) = mpsc::sync_channel::<PreparedBatch>(num_devices * 2);
+    let rx = Arc::new(Mutex::new(rx));
 
     let refs_for_thread = Arc::clone(&references_arc);
     let kmer_sets_for_thread = Arc::clone(&ref_kmer_sets_arc);
@@ -347,230 +348,141 @@ fn main() -> Result<()> {
             };
 
             if tx.send(prepared).is_err() {
+                // All GPU workers have exited; nothing left to consume batches.
                 break;
             }
         }
         Ok(())
     });
 
-    // Main thread: receives prepared batches and runs GPU alignment
-    let mut batch_count = 0u64;
-    let mut total_reads = 0usize;
+    // Spawn one GPU worker thread per device. Each owns its own CUDA context,
+    // kernel module, and reference copy, and pulls batches from the shared queue.
+    let mut worker_handles = Vec::with_capacity(num_devices);
+    for &device_id in &device_ids {
+        let rx = Arc::clone(&rx);
+        let writer = Arc::clone(&writer);
+        let references_arc = Arc::clone(&references_arc);
+        let ref_data = Arc::clone(&ref_data);
+        let ref_lengths = Arc::clone(&ref_lengths);
+        let ref_offsets = Arc::clone(&ref_offsets);
+        let header_tags = header_tags.clone();
+        let gap_open = args.gap_open;
+        let gap_extend = args.gap_extend;
+        let mismatch = args.mismatch;
+        let skip_fail = args.skip_fail;
 
-    while let Ok(prepared) = rx.recv() {
-        batch_count += 1;
-        total_reads += prepared.num_reads;
-        let num_refs = prepared.num_refs;
-        let num_gpu_pairs = prepared.pair_query_idx.len();
+        let handle = thread::spawn(move || -> Result<WorkerStats> {
+            // Initialize this device's CUDA context (binds it to this thread).
+            let ctx = CudaContext::new(device_id)
+                .with_context(|| format!("Failed to initialize CUDA device {}", device_id))?;
+            ctx.bind_to_thread()
+                .with_context(|| format!("Failed to bind CUDA device {}", device_id))?;
+            let stream = ctx.default_stream();
+            info!("CUDA device {} initialized", device_id);
 
-        info!("Processing batch {} with {} reads (total: {}), {} GPU pairs ({} both-filtered)",
-              batch_count, prepared.num_reads, total_reads,
-              num_gpu_pairs, prepared.kmer_fail_count);
+            // Load the WFA kernel into this device's context.
+            let module = ctx.load_module(Ptx::from_src(ptx_src))
+                .context("Failed to load WFA PTX module")?;
+            let kernel = module.load_function("wfa_align_kernel")
+                .context("Failed to load wfa_align_kernel function")?;
 
-        // Upload forward query data to GPU
-        let d_fwd_queries = stream.memcpy_stod(&prepared.query_data)?;
-        let d_fwd_query_lengths = stream.memcpy_stod(&prepared.query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-        let d_fwd_query_offsets = stream.memcpy_stod(&prepared.query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+            // Upload reference sequences to this device (persistent across batches).
+            let d_refs = stream.memcpy_stod(ref_data.as_slice())?;
+            let d_ref_lengths = stream.memcpy_stod(ref_lengths.as_slice())?;
+            let d_ref_offsets = stream.memcpy_stod(ref_offsets.as_slice())?;
 
-        // Upload RC query data to GPU
-        let d_rc_queries = stream.memcpy_stod(&prepared.rc_query_data)?;
-        let d_rc_query_lengths = stream.memcpy_stod(&prepared.rc_query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-        let d_rc_query_offsets = stream.memcpy_stod(&prepared.rc_query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-
-        // Collect GPU results
-        let mut all_scores = vec![0i32; num_gpu_pairs];
-        let mut all_cigar_ops: Vec<Vec<i8>> = vec![Vec::new(); num_gpu_pairs];
-        let mut all_cigar_lengths = vec![0i32; num_gpu_pairs];
-
-        // Split GPU pairs into forward and RC sub-groups for separate kernel launches
-        let mut fwd_pair_indices: Vec<usize> = Vec::new();
-        let mut rc_pair_indices: Vec<usize> = Vec::new();
-        for (i, &is_rc) in prepared.pair_is_rc.iter().enumerate() {
-            if is_rc {
-                rc_pair_indices.push(i);
+            // Query this device's free memory and size GPU sub-batches at 75%.
+            let (free_mem, total_mem) = cudarc::driver::result::mem_get_info()
+                .context("Failed to query GPU memory")?;
+            let usable_mem = (free_mem as f64 * 0.75) as usize;
+            let max_gpu_pairs = if total_bytes_per_pair > 0 {
+                std::cmp::max(1, usable_mem / total_bytes_per_pair)
             } else {
-                fwd_pair_indices.push(i);
-            }
-        }
-
-        // --- Launch forward orientation alignments ---
-        if !fwd_pair_indices.is_empty() {
-            let fwd_query_idx: Vec<i32> = fwd_pair_indices.iter()
-                .map(|&i| prepared.pair_query_idx[i])
-                .collect();
-            let fwd_ref_idx: Vec<i32> = fwd_pair_indices.iter()
-                .map(|&i| prepared.pair_ref_idx[i])
-                .collect();
-
-            let results = launch_alignment_kernel(
-                &stream, &kernel,
-                &d_fwd_queries, &d_fwd_query_lengths, &d_fwd_query_offsets,
-                &d_refs, &d_ref_lengths, &d_ref_offsets,
-                &fwd_query_idx, &fwd_ref_idx,
-                args.gap_open, args.gap_extend, args.mismatch,
-                max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
-            )?;
-
-            for (local_idx, &global_gpu_idx) in fwd_pair_indices.iter().enumerate() {
-                all_scores[global_gpu_idx] = results.scores[local_idx];
-                all_cigar_lengths[global_gpu_idx] = results.cigar_lengths[local_idx];
-                all_cigar_ops[global_gpu_idx] = results.cigar_ops[local_idx].clone();
-            }
-        }
-
-        // --- Launch reverse complement orientation alignments ---
-        if !rc_pair_indices.is_empty() {
-            let rc_query_idx: Vec<i32> = rc_pair_indices.iter()
-                .map(|&i| prepared.pair_query_idx[i])
-                .collect();
-            let rc_ref_idx: Vec<i32> = rc_pair_indices.iter()
-                .map(|&i| prepared.pair_ref_idx[i])
-                .collect();
-
-            let results = launch_alignment_kernel(
-                &stream, &kernel,
-                &d_rc_queries, &d_rc_query_lengths, &d_rc_query_offsets,
-                &d_refs, &d_ref_lengths, &d_ref_offsets,
-                &rc_query_idx, &rc_ref_idx,
-                args.gap_open, args.gap_extend, args.mismatch,
-                max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
-            )?;
-
-            for (local_idx, &global_gpu_idx) in rc_pair_indices.iter().enumerate() {
-                all_scores[global_gpu_idx] = results.scores[local_idx];
-                all_cigar_lengths[global_gpu_idx] = results.cigar_lengths[local_idx];
-                all_cigar_ops[global_gpu_idx] = results.cigar_ops[local_idx].clone();
-            }
-        }
-
-        // Write output: for each read×ref pair, pick the best orientation
-        let mut cpu_fallback_count = 0;
-        for qi in 0..prepared.num_reads {
-            let tag_values: Vec<String> = if !header_tags.is_empty() {
-                header_tags.iter().map(|tag| {
-                    extract_tag_value(prepared.batch[qi].desc.as_deref(), tag)
-                }).collect()
-            } else {
-                Vec::new()
+                batch_size
             };
+            info!("Device {}: {:.0} MB free / {:.0} MB total, {:.1} KB/pair, max {} pairs per GPU sub-batch",
+                  device_id, free_mem as f64 / 1048576.0, total_mem as f64 / 1048576.0,
+                  total_bytes_per_pair as f64 / 1024.0, max_gpu_pairs);
 
-            for ri in 0..num_refs {
-                let global_idx = qi * num_refs + ri;
+            let mut stats = WorkerStats::default();
 
-                let fwd_passed = prepared.fwd_kmer_pass[global_idx];
-                let rc_passed = prepared.rc_kmer_pass[global_idx];
-
-                // If neither orientation passed the k-mer filter, report FAILED
-                // (or skip entirely if --skip-fail is set)
-                if !fwd_passed && !rc_passed {
-                    if !args.skip_fail {
-                        let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, "FAILED", "."];
-                        for val in &tag_values {
-                            fields.push(val.as_str());
-                        }
-                        writer.write_record(&fields)?;
+            loop {
+                // Pull the next prepared batch from the shared queue. The lock is
+                // held only across recv(); when the reader finishes and drops the
+                // sender, recv() returns Err and this worker exits.
+                let prepared = {
+                    let guard = rx.lock().expect("batch channel mutex poisoned");
+                    match guard.recv() {
+                        Ok(p) => p,
+                        Err(_) => break,
                     }
-                    continue;
+                };
+
+                stats.batches += 1;
+                stats.reads += prepared.num_reads;
+                let num_gpu_pairs = prepared.pair_query_idx.len();
+
+                info!("Device {}: processing batch of {} reads, {} GPU pairs ({} both-filtered)",
+                      device_id, prepared.num_reads, num_gpu_pairs, prepared.kmer_fail_count);
+
+                let (rows, cpu_fallbacks) = process_batch(
+                    &stream, &kernel, &prepared,
+                    &d_refs, &d_ref_lengths, &d_ref_offsets,
+                    references_arc.as_slice(), &header_tags,
+                    gap_open, gap_extend, mismatch,
+                    max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
+                    skip_fail,
+                )?;
+                stats.cpu_fallbacks += cpu_fallbacks;
+
+                if cpu_fallbacks > 0 {
+                    info!("Device {}: CPU fallback used for {} pairs in this batch",
+                          device_id, cpu_fallbacks);
                 }
 
-                // Get forward result (if it was aligned)
-                let fwd_result = if fwd_passed {
-                    let gpu_idx = prepared.fwd_gpu_idx[global_idx]
-                        .expect("forward-passed pair must have a GPU index");
-                    let score = all_scores[gpu_idx];
-                    let cigar_len = all_cigar_lengths[gpu_idx] as usize;
-                    if score >= 0 && cigar_len > 0 {
-                        let ops: Vec<u8> = all_cigar_ops[gpu_idx]
-                            .iter()
-                            .map(|&x| x as u8)
-                            .collect();
-                        Some((score, ops_to_cigar(&ops)))
-                    } else {
-                        cpu_fallback_count += 1;
-                        debug!("CPU fallback (fwd) for read {} vs ref {}", prepared.batch[qi].id, references_arc[ri].id);
-                        let cigar = cpu_align(
-                            &prepared.batch[qi].seq,
-                            &references_arc[ri].seq,
-                            args.gap_open,
-                            args.gap_extend,
-                            args.mismatch,
-                        );
-                        if cigar == "*" {
-                            None
-                        } else {
-                            Some((max_score as i32 + 1, cigar))
-                        }
+                // Write this batch's rows atomically so that all rows for a given
+                // read stay contiguous in the output.
+                {
+                    let mut w = writer.lock().expect("writer mutex poisoned");
+                    for row in &rows {
+                        w.write_record(row)?;
                     }
-                } else {
-                    None
-                };
-
-                // Get RC result (if it was aligned)
-                let rc_result = if rc_passed {
-                    let gpu_idx = prepared.rc_gpu_idx[global_idx]
-                        .expect("rc-passed pair must have a GPU index");
-                    let score = all_scores[gpu_idx];
-                    let cigar_len = all_cigar_lengths[gpu_idx] as usize;
-                    if score >= 0 && cigar_len > 0 {
-                        let ops: Vec<u8> = all_cigar_ops[gpu_idx]
-                            .iter()
-                            .map(|&x| x as u8)
-                            .collect();
-                        Some((score, ops_to_cigar(&ops)))
-                    } else {
-                        cpu_fallback_count += 1;
-                        debug!("CPU fallback (rc) for read {} vs ref {}", prepared.batch[qi].id, references_arc[ri].id);
-                        let rc_seq = reverse_complement(&prepared.batch[qi].seq);
-                        let cigar = cpu_align(
-                            &rc_seq,
-                            &references_arc[ri].seq,
-                            args.gap_open,
-                            args.gap_extend,
-                            args.mismatch,
-                        );
-                        if cigar == "*" {
-                            None
-                        } else {
-                            Some((max_score as i32 + 1, cigar))
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // Pick the best orientation (lower score = better alignment)
-                let (cigar, strand) = match (fwd_result, rc_result) {
-                    (None, None) => ("*".to_string(), "."),
-                    (Some((_score, cigar)), None) => (cigar, "+"),
-                    (None, Some((_score, cigar))) => (cigar, "-"),
-                    (Some((fwd_score, fwd_cigar)), Some((rc_score, rc_cigar))) => {
-                        if fwd_score <= rc_score {
-                            (fwd_cigar, "+")
-                        } else {
-                            (rc_cigar, "-")
-                        }
-                    }
-                };
-
-                let mut fields: Vec<&str> = vec![&prepared.batch[qi].id, &references_arc[ri].id, &cigar, strand];
-                for val in &tag_values {
-                    fields.push(val.as_str());
+                    w.flush()?;
                 }
-                writer.write_record(&fields)?;
             }
-        }
 
-        if cpu_fallback_count > 0 {
-            info!("CPU fallback used for {} pairs in batch {}", cpu_fallback_count, batch_count);
-        }
+            Ok(stats)
+        });
+        worker_handles.push(handle);
     }
 
-    // Wait for the CPU thread to finish
+    // Drop main's handle to the receiver so that once every worker exits, the
+    // reader's channel closes (and a blocked send unblocks with an error).
+    drop(rx);
+
+    // Collect results from all GPU workers.
+    let mut total_reads = 0usize;
+    let mut batch_count = 0u64;
+    let mut total_cpu_fallbacks = 0usize;
+    for (i, handle) in worker_handles.into_iter().enumerate() {
+        let stats = handle.join()
+            .map_err(|e| anyhow!("GPU worker thread {} panicked: {:?}", i, e))?
+            .with_context(|| format!("GPU worker for device {} failed", device_ids[i]))?;
+        total_reads += stats.reads;
+        batch_count += stats.batches;
+        total_cpu_fallbacks += stats.cpu_fallbacks;
+    }
+
+    // Wait for the CPU reader thread to finish.
     cpu_thread.join()
         .map_err(|e| anyhow!("CPU reader thread panicked: {:?}", e))?
         .context("CPU reader thread failed")?;
 
-    info!("Alignment completed. Processed {} reads in {} batches", total_reads, batch_count);
+    if total_cpu_fallbacks > 0 {
+        info!("CPU fallback used for {} pairs total", total_cpu_fallbacks);
+    }
+    info!("Alignment completed. Processed {} reads in {} batches across {} device(s)",
+          total_reads, batch_count, num_devices);
     Ok(())
 }
 
@@ -596,11 +508,254 @@ struct PreparedBatch {
     num_refs: usize,
 }
 
+/// Per-worker counters aggregated after all GPU threads finish.
+#[derive(Default)]
+struct WorkerStats {
+    batches: u64,
+    reads: usize,
+    cpu_fallbacks: usize,
+}
+
 /// Results from a GPU kernel launch
 struct KernelResults {
     scores: Vec<i32>,
     cigar_ops: Vec<Vec<i8>>,
     cigar_lengths: Vec<i32>,
+}
+
+/// Run GPU alignment for one prepared batch on the given device stream/kernel,
+/// then format the output rows. Returns the rows (one per read×reference pair)
+/// and the number of pairs that fell back to the CPU aligner.
+///
+/// This is invoked from each GPU worker thread; `stream`, `kernel`, and the
+/// `d_ref*` slices all belong to that worker's device context.
+fn process_batch(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    prepared: &PreparedBatch,
+    d_refs: &CudaSlice<i8>,
+    d_ref_lengths: &CudaSlice<i32>,
+    d_ref_offsets: &CudaSlice<i32>,
+    references: &[SequenceRecord],
+    header_tags: &[String],
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+    max_k: usize,
+    num_diags: usize,
+    max_score: usize,
+    max_cigar_len: usize,
+    max_gpu_pairs: usize,
+    skip_fail: bool,
+) -> Result<(Vec<Vec<String>>, usize)> {
+    let num_refs = prepared.num_refs;
+    let num_gpu_pairs = prepared.pair_query_idx.len();
+
+    // Upload forward query data to GPU
+    let d_fwd_queries = stream.memcpy_stod(&prepared.query_data)?;
+    let d_fwd_query_lengths = stream.memcpy_stod(&prepared.query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+    let d_fwd_query_offsets = stream.memcpy_stod(&prepared.query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+
+    // Upload RC query data to GPU
+    let d_rc_queries = stream.memcpy_stod(&prepared.rc_query_data)?;
+    let d_rc_query_lengths = stream.memcpy_stod(&prepared.rc_query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+    let d_rc_query_offsets = stream.memcpy_stod(&prepared.rc_query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+
+    // Collect GPU results
+    let mut all_scores = vec![0i32; num_gpu_pairs];
+    let mut all_cigar_ops: Vec<Vec<i8>> = vec![Vec::new(); num_gpu_pairs];
+    let mut all_cigar_lengths = vec![0i32; num_gpu_pairs];
+
+    // Split GPU pairs into forward and RC sub-groups for separate kernel launches
+    let mut fwd_pair_indices: Vec<usize> = Vec::new();
+    let mut rc_pair_indices: Vec<usize> = Vec::new();
+    for (i, &is_rc) in prepared.pair_is_rc.iter().enumerate() {
+        if is_rc {
+            rc_pair_indices.push(i);
+        } else {
+            fwd_pair_indices.push(i);
+        }
+    }
+
+    // --- Launch forward orientation alignments ---
+    if !fwd_pair_indices.is_empty() {
+        let fwd_query_idx: Vec<i32> = fwd_pair_indices.iter()
+            .map(|&i| prepared.pair_query_idx[i])
+            .collect();
+        let fwd_ref_idx: Vec<i32> = fwd_pair_indices.iter()
+            .map(|&i| prepared.pair_ref_idx[i])
+            .collect();
+
+        let results = launch_alignment_kernel(
+            stream, kernel,
+            &d_fwd_queries, &d_fwd_query_lengths, &d_fwd_query_offsets,
+            d_refs, d_ref_lengths, d_ref_offsets,
+            &fwd_query_idx, &fwd_ref_idx,
+            gap_open, gap_extend, mismatch,
+            max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
+        )?;
+
+        for (local_idx, &global_gpu_idx) in fwd_pair_indices.iter().enumerate() {
+            all_scores[global_gpu_idx] = results.scores[local_idx];
+            all_cigar_lengths[global_gpu_idx] = results.cigar_lengths[local_idx];
+            all_cigar_ops[global_gpu_idx] = results.cigar_ops[local_idx].clone();
+        }
+    }
+
+    // --- Launch reverse complement orientation alignments ---
+    if !rc_pair_indices.is_empty() {
+        let rc_query_idx: Vec<i32> = rc_pair_indices.iter()
+            .map(|&i| prepared.pair_query_idx[i])
+            .collect();
+        let rc_ref_idx: Vec<i32> = rc_pair_indices.iter()
+            .map(|&i| prepared.pair_ref_idx[i])
+            .collect();
+
+        let results = launch_alignment_kernel(
+            stream, kernel,
+            &d_rc_queries, &d_rc_query_lengths, &d_rc_query_offsets,
+            d_refs, d_ref_lengths, d_ref_offsets,
+            &rc_query_idx, &rc_ref_idx,
+            gap_open, gap_extend, mismatch,
+            max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
+        )?;
+
+        for (local_idx, &global_gpu_idx) in rc_pair_indices.iter().enumerate() {
+            all_scores[global_gpu_idx] = results.scores[local_idx];
+            all_cigar_lengths[global_gpu_idx] = results.cigar_lengths[local_idx];
+            all_cigar_ops[global_gpu_idx] = results.cigar_ops[local_idx].clone();
+        }
+    }
+
+    // Build output: for each read×ref pair, pick the best orientation
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut cpu_fallback_count = 0usize;
+    for qi in 0..prepared.num_reads {
+        let tag_values: Vec<String> = if !header_tags.is_empty() {
+            header_tags.iter().map(|tag| {
+                extract_tag_value(prepared.batch[qi].desc.as_deref(), tag)
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        for ri in 0..num_refs {
+            let global_idx = qi * num_refs + ri;
+
+            let fwd_passed = prepared.fwd_kmer_pass[global_idx];
+            let rc_passed = prepared.rc_kmer_pass[global_idx];
+
+            // If neither orientation passed the k-mer filter, report FAILED
+            // (or skip entirely if --skip-fail is set)
+            if !fwd_passed && !rc_passed {
+                if !skip_fail {
+                    let mut row = vec![
+                        prepared.batch[qi].id.clone(),
+                        references[ri].id.clone(),
+                        "FAILED".to_string(),
+                        ".".to_string(),
+                    ];
+                    for val in &tag_values {
+                        row.push(val.clone());
+                    }
+                    rows.push(row);
+                }
+                continue;
+            }
+
+            // Get forward result (if it was aligned)
+            let fwd_result = if fwd_passed {
+                let gpu_idx = prepared.fwd_gpu_idx[global_idx]
+                    .expect("forward-passed pair must have a GPU index");
+                let score = all_scores[gpu_idx];
+                let cigar_len = all_cigar_lengths[gpu_idx] as usize;
+                if score >= 0 && cigar_len > 0 {
+                    let ops: Vec<u8> = all_cigar_ops[gpu_idx]
+                        .iter()
+                        .map(|&x| x as u8)
+                        .collect();
+                    Some((score, ops_to_cigar(&ops)))
+                } else {
+                    cpu_fallback_count += 1;
+                    debug!("CPU fallback (fwd) for read {} vs ref {}", prepared.batch[qi].id, references[ri].id);
+                    let cigar = cpu_align(
+                        &prepared.batch[qi].seq,
+                        &references[ri].seq,
+                        gap_open,
+                        gap_extend,
+                        mismatch,
+                    );
+                    if cigar == "*" {
+                        None
+                    } else {
+                        Some((max_score as i32 + 1, cigar))
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Get RC result (if it was aligned)
+            let rc_result = if rc_passed {
+                let gpu_idx = prepared.rc_gpu_idx[global_idx]
+                    .expect("rc-passed pair must have a GPU index");
+                let score = all_scores[gpu_idx];
+                let cigar_len = all_cigar_lengths[gpu_idx] as usize;
+                if score >= 0 && cigar_len > 0 {
+                    let ops: Vec<u8> = all_cigar_ops[gpu_idx]
+                        .iter()
+                        .map(|&x| x as u8)
+                        .collect();
+                    Some((score, ops_to_cigar(&ops)))
+                } else {
+                    cpu_fallback_count += 1;
+                    debug!("CPU fallback (rc) for read {} vs ref {}", prepared.batch[qi].id, references[ri].id);
+                    let rc_seq = reverse_complement(&prepared.batch[qi].seq);
+                    let cigar = cpu_align(
+                        &rc_seq,
+                        &references[ri].seq,
+                        gap_open,
+                        gap_extend,
+                        mismatch,
+                    );
+                    if cigar == "*" {
+                        None
+                    } else {
+                        Some((max_score as i32 + 1, cigar))
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Pick the best orientation (lower score = better alignment)
+            let (cigar, strand) = match (fwd_result, rc_result) {
+                (None, None) => ("*".to_string(), "."),
+                (Some((_score, cigar)), None) => (cigar, "+"),
+                (None, Some((_score, cigar))) => (cigar, "-"),
+                (Some((fwd_score, fwd_cigar)), Some((rc_score, rc_cigar))) => {
+                    if fwd_score <= rc_score {
+                        (fwd_cigar, "+")
+                    } else {
+                        (rc_cigar, "-")
+                    }
+                }
+            };
+
+            let mut row = vec![
+                prepared.batch[qi].id.clone(),
+                references[ri].id.clone(),
+                cigar,
+                strand.to_string(),
+            ];
+            for val in &tag_values {
+                row.push(val.clone());
+            }
+            rows.push(row);
+        }
+    }
+
+    Ok((rows, cpu_fallback_count))
 }
 
 /// Launch the WFA alignment kernel for a set of pairs, handling sub-batching for GPU memory.
@@ -1161,8 +1316,8 @@ fn read_sequences_fully(path: &PathBuf) -> Result<Vec<SequenceRecord>> {
     Ok(seqs)
 }
 
-fn create_writer(output_path: &Option<PathBuf>) -> Result<csv::Writer<Box<dyn io::Write>>> {
-    let w: Box<dyn io::Write> = match output_path {
+fn create_writer(output_path: &Option<PathBuf>) -> Result<csv::Writer<Box<dyn io::Write + Send>>> {
+    let w: Box<dyn io::Write + Send> = match output_path {
         Some(p) => Box::new(File::create(p)?),
         None => Box::new(io::stdout()),
     };
