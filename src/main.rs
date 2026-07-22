@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::mpsc;
 use std::thread;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, Context, anyhow};
 use clap::Parser;
@@ -66,6 +67,19 @@ struct Args {
     /// own worker thread and processes batches in parallel.
     #[clap(long, value_delimiter = ',')]
     devices: Option<Vec<usize>>,
+
+    /// Number of CPU threads that prepare batches (reverse-complement, packing,
+    /// and the k-mer pre-filter) before they reach the GPUs. This preparation is
+    /// the stage most likely to starve the GPUs, so it runs as a parallel pool.
+    /// 0 = auto (roughly all hardware threads not reserved for GPU workers).
+    #[clap(long, default_value = "0")]
+    prep_threads: usize,
+
+    /// Number of CPU threads that post-process GPU results (CPU fallback
+    /// alignment and output formatting) off the GPU worker threads, so a GPU is
+    /// never blocked formatting or re-aligning. 0 = auto.
+    #[clap(long, default_value = "0")]
+    post_threads: usize,
 
     /// K-mer length for the pre-alignment filter. When set (> 0), unique k-mers
     /// of the read are checked against the reference before running WFA.
@@ -163,7 +177,7 @@ fn main() -> Result<()> {
     let references = read_sequences_fully(&args.references)?;
     info!("Loaded {} reference sequences", references.len());
 
-    // Build owned k-mer sets for each reference (used by the background thread's pre-filter)
+    // Build owned k-mer sets for each reference (used by the prep threads' pre-filter)
     let ref_kmer_sets_owned: Vec<HashSet<Vec<u8>>> = if kmer_filter_enabled {
         references.iter().map(|r| collect_kmers_owned(&r.seq, args.kmer_length)).collect()
     } else {
@@ -177,7 +191,13 @@ fn main() -> Result<()> {
     let ref_lengths = Arc::new(ref_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>());
     let ref_offsets = Arc::new(ref_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>());
 
-    // Create output writer, shared across worker threads behind a mutex.
+    // Reference records shared read-only with the prep pool (k-mer filter) and
+    // the post pool (output formatting + CPU fallback).
+    let references_arc = Arc::new(references);
+    let ref_kmer_sets_arc = Arc::new(ref_kmer_sets_owned);
+
+    // Create the output writer and emit the header row up front. The writer is
+    // then moved into a single dedicated writer thread (below).
     let mut writer = create_writer(&args.output)?;
     {
         let mut header_fields: Vec<&str> = vec!["read_name", "reference_name", "cigar", "strand"];
@@ -186,7 +206,6 @@ fn main() -> Result<()> {
         }
         writer.write_record(&header_fields)?;
     }
-    let writer = Arc::new(Mutex::new(writer));
 
     // Pre-compute GPU parameters (identical across devices)
     let max_k = std::cmp::max(args.max_read_length, args.max_ref_length);
@@ -202,174 +221,144 @@ fn main() -> Result<()> {
     let output_bytes_per_pair = 4 + cigar_bytes_per_pair + 4; // score(i32) + cigar(i8s) + cigar_len(i32)
     let total_bytes_per_pair = ws_bytes_per_pair + output_bytes_per_pair;
 
-    // ================================================================
-    // Multi-GPU pipeline: one CPU reader thread feeds N GPU worker threads
-    // ================================================================
-
-    info!("Starting alignment of reads from {}", args.reads.display());
-
-    // Shared, immutable inputs for the background reader thread.
-    let reads_path = args.reads.clone();
+    // Copy the scalar penalties/flags out of `args` so each worker closure can
+    // capture them by value (they are `Copy`).
+    let gap_open = args.gap_open;
+    let gap_extend = args.gap_extend;
+    let mismatch = args.mismatch;
+    let skip_fail = args.skip_fail;
     let batch_size = args.batch_size;
     let kmer_length = args.kmer_length;
     let kmer_threshold = args.kmer_threshold;
-    let references_arc = Arc::new(references);
-    let ref_kmer_sets_arc = Arc::new(ref_kmer_sets_owned);
 
-    // Channel for sending prepared batches from the CPU thread to the GPU
-    // workers. Capacity scales with the device count so all GPUs stay fed.
-    // Wrapping the receiver in a mutex turns std's MPSC into an MPMC queue that
-    // the worker threads can share.
-    let (tx, rx) = mpsc::sync_channel::<PreparedBatch>(num_devices * 2);
-    let rx = Arc::new(Mutex::new(rx));
+    // Decide how many CPU threads to devote to each CPU-bound stage. Preparation
+    // (k-mer filter, reverse-complement, packing) is the heavy stage that tends
+    // to starve the GPUs, so it gets most of the cores; post-processing is
+    // usually light (only pairs over the score budget hit the CPU aligner).
+    let hw_par = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let prep_threads = if args.prep_threads > 0 {
+        args.prep_threads
+    } else {
+        std::cmp::max(2, hw_par.saturating_sub(num_devices + 1))
+    };
+    let post_threads = if args.post_threads > 0 {
+        args.post_threads
+    } else {
+        std::cmp::max(2, num_devices)
+    };
 
-    let refs_for_thread = Arc::clone(&references_arc);
-    let kmer_sets_for_thread = Arc::clone(&ref_kmer_sets_arc);
+    // ================================================================
+    // Pipeline: reader -> prep pool -> GPU workers -> post pool -> writer
+    //
+    //   reader (1)      : reads raw batches from disk
+    //   prep pool (P)   : reverse-complement, pack, k-mer pre-filter
+    //   GPU workers (N) : upload -> WFA kernel -> download  (GPU work only)
+    //   post pool (Q)   : CPU fallback + output row formatting
+    //   writer (1)      : serializes rows to the output TSV
+    //
+    // Each stage is decoupled by a bounded channel so a GPU never has to read
+    // from disk, run the CPU fallback, format rows, or wait on the writer.
+    // ================================================================
 
-    // Spawn background CPU thread: reads batches, generates RC, and runs k-mer pre-filter
-    let cpu_thread = thread::spawn(move || -> Result<()> {
+    info!("Starting alignment of reads from {}", args.reads.display());
+    info!("Pipeline threads: 1 reader, {} prep, {} GPU worker(s), {} post, 1 writer (hw parallelism: {})",
+          prep_threads, num_devices, post_threads, hw_par);
+
+    // Stage 1 -> 2: raw batches from the reader to the prep pool.
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<SequenceRecord>>(prep_threads * 2);
+    let raw_rx = Arc::new(Mutex::new(raw_rx));
+
+    // Stage 2 -> 3: prepared batches from the prep pool to the GPU workers.
+    let (prep_tx, prep_rx) = mpsc::sync_channel::<PreparedBatch>(num_devices * 2);
+    let prep_rx = Arc::new(Mutex::new(prep_rx));
+
+    // Stage 3 -> 4: GPU results from the workers to the post-processing pool.
+    let (post_tx, post_rx) = mpsc::sync_channel::<GpuBatchResult>(num_devices * 2);
+    let post_rx = Arc::new(Mutex::new(post_rx));
+
+    // Stage 4 -> 5: formatted rows from the post pool to the single writer.
+    let (rows_tx, rows_rx) = mpsc::sync_channel::<Vec<Vec<String>>>(post_threads * 2);
+
+    let pipeline_start = Instant::now();
+
+    // --- Stage 1: reader thread ---
+    let reads_path = args.reads.clone();
+    let reader_handle = thread::spawn(move || -> Result<StageStats> {
         let mut reader = create_sequence_reader(&reads_path)?;
-
+        let mut stats = StageStats::default();
         loop {
+            let t0 = Instant::now();
             let batch = reader.read_batch(batch_size)?;
+            stats.busy += t0.elapsed();
             if batch.is_empty() {
                 break;
             }
-
-            let num_reads = batch.len();
-            let num_refs = refs_for_thread.len();
-            let num_pairs = num_reads * num_refs;
-
-            // Generate reverse complement sequences for each read
-            let rc_seqs: Vec<Vec<u8>> = batch.iter()
-                .map(|rec| reverse_complement(&rec.seq))
-                .collect();
-
-            // Pack forward query sequences for GPU upload
-            let (query_data, query_lengths, query_offsets) = pack_sequences(&batch);
-
-            // Pack reverse complement query sequences for GPU upload
-            let (rc_query_data, rc_query_lengths, rc_query_offsets) = pack_sequences_raw(&rc_seqs);
-
-            // Run k-mer pre-filter for both orientations
-            let mut fwd_kmer_pass = vec![true; num_pairs];
-            let mut rc_kmer_pass = vec![true; num_pairs];
-            let mut kmer_fail_count = 0usize;
-
-            if kmer_filter_enabled {
-                for qi in 0..num_reads {
-                    let fwd_kmers = collect_kmers_owned(&batch[qi].seq, kmer_length);
-                    let rc_kmers = collect_kmers_owned(&rc_seqs[qi], kmer_length);
-
-                    for ri in 0..num_refs {
-                        let global_idx = qi * num_refs + ri;
-
-                        // Check forward orientation
-                        if !fwd_kmers.is_empty() {
-                            let hits = fwd_kmers.iter()
-                                .filter(|km| kmer_sets_for_thread[ri].contains(km.as_slice()))
-                                .count();
-                            let fraction = hits as f64 / fwd_kmers.len() as f64;
-                            if fraction < kmer_threshold {
-                                fwd_kmer_pass[global_idx] = false;
-                            }
-                        }
-
-                        // Check reverse complement orientation
-                        if !rc_kmers.is_empty() {
-                            let hits = rc_kmers.iter()
-                                .filter(|km| kmer_sets_for_thread[ri].contains(km.as_slice()))
-                                .count();
-                            let fraction = hits as f64 / rc_kmers.len() as f64;
-                            if fraction < kmer_threshold {
-                                rc_kmer_pass[global_idx] = false;
-                            }
-                        }
-
-                        // Count pairs where BOTH orientations fail
-                        if !fwd_kmer_pass[global_idx] && !rc_kmer_pass[global_idx] {
-                            kmer_fail_count += 1;
-                        }
-                    }
-                }
-            }
-
-            // Build pair indices for passing pairs (both orientations)
-            let mut pair_query_idx = Vec::with_capacity(num_pairs * 2);
-            let mut pair_ref_idx = Vec::with_capacity(num_pairs * 2);
-            let mut pair_is_rc = Vec::with_capacity(num_pairs * 2);
-
-            // Forward pairs
-            let mut fwd_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
-            for qi in 0..num_reads {
-                for ri in 0..num_refs {
-                    let global_idx = qi * num_refs + ri;
-                    if fwd_kmer_pass[global_idx] {
-                        fwd_gpu_idx[global_idx] = Some(pair_query_idx.len());
-                        pair_query_idx.push(qi as i32);
-                        pair_ref_idx.push(ri as i32);
-                        pair_is_rc.push(false);
-                    }
-                }
-            }
-
-            // RC pairs
-            let mut rc_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
-            for qi in 0..num_reads {
-                for ri in 0..num_refs {
-                    let global_idx = qi * num_refs + ri;
-                    if rc_kmer_pass[global_idx] {
-                        rc_gpu_idx[global_idx] = Some(pair_query_idx.len());
-                        pair_query_idx.push(qi as i32);
-                        pair_ref_idx.push(ri as i32);
-                        pair_is_rc.push(true);
-                    }
-                }
-            }
-
-            let prepared = PreparedBatch {
-                batch,
-                query_data,
-                query_lengths,
-                query_offsets,
-                rc_query_data,
-                rc_query_lengths,
-                rc_query_offsets,
-                fwd_kmer_pass,
-                rc_kmer_pass,
-                kmer_fail_count,
-                pair_query_idx,
-                pair_ref_idx,
-                pair_is_rc,
-                fwd_gpu_idx,
-                rc_gpu_idx,
-                num_reads,
-                num_refs,
-            };
-
-            if tx.send(prepared).is_err() {
-                // All GPU workers have exited; nothing left to consume batches.
+            stats.batches += 1;
+            let t1 = Instant::now();
+            if raw_tx.send(batch).is_err() {
+                // Downstream is gone; nothing left to consume raw batches.
                 break;
             }
+            stats.send_wait += t1.elapsed();
         }
-        Ok(())
+        Ok(stats)
     });
 
-    // Spawn one GPU worker thread per device. Each owns its own CUDA context,
-    // kernel module, and reference copy, and pulls batches from the shared queue.
+    // --- Stage 2: prep pool ---
+    let mut prep_handles = Vec::with_capacity(prep_threads);
+    for _ in 0..prep_threads {
+        let raw_rx = Arc::clone(&raw_rx);
+        let prep_tx = prep_tx.clone();
+        let references_arc = Arc::clone(&references_arc);
+        let ref_kmer_sets_arc = Arc::clone(&ref_kmer_sets_arc);
+        let handle = thread::spawn(move || -> Result<StageStats> {
+            let mut stats = StageStats::default();
+            loop {
+                let t0 = Instant::now();
+                let batch = {
+                    let guard = raw_rx.lock().expect("raw batch channel mutex poisoned");
+                    guard.recv()
+                };
+                stats.recv_wait += t0.elapsed();
+                let batch = match batch {
+                    Ok(b) => b,
+                    Err(_) => break, // reader finished and closed the channel
+                };
+
+                let t1 = Instant::now();
+                let prepared = prepare_batch(
+                    batch,
+                    &references_arc,
+                    &ref_kmer_sets_arc,
+                    kmer_filter_enabled,
+                    kmer_length,
+                    kmer_threshold,
+                );
+                stats.busy += t1.elapsed();
+                stats.batches += 1;
+
+                let t2 = Instant::now();
+                if prep_tx.send(prepared).is_err() {
+                    break; // GPU workers all exited
+                }
+                stats.send_wait += t2.elapsed();
+            }
+            Ok(stats)
+        });
+        prep_handles.push(handle);
+    }
+    // Only the prep threads hold senders now; drop main's so the prepared
+    // channel closes once every prep thread finishes.
+    drop(prep_tx);
+
+    // --- Stage 3: GPU worker threads (one per device) ---
     let mut worker_handles = Vec::with_capacity(num_devices);
     for &device_id in &device_ids {
-        let rx = Arc::clone(&rx);
-        let writer = Arc::clone(&writer);
-        let references_arc = Arc::clone(&references_arc);
+        let prep_rx = Arc::clone(&prep_rx);
+        let post_tx = post_tx.clone();
         let ref_data = Arc::clone(&ref_data);
         let ref_lengths = Arc::clone(&ref_lengths);
         let ref_offsets = Arc::clone(&ref_offsets);
-        let header_tags = header_tags.clone();
-        let gap_open = args.gap_open;
-        let gap_extend = args.gap_extend;
-        let mismatch = args.mismatch;
-        let skip_fail = args.skip_fail;
 
         let handle = thread::spawn(move || -> Result<WorkerStats> {
             // Initialize this device's CUDA context (binds it to this thread).
@@ -408,94 +397,199 @@ fn main() -> Result<()> {
 
             loop {
                 // Pull the next prepared batch from the shared queue. The lock is
-                // held only across recv(); when the reader finishes and drops the
-                // sender, recv() returns Err and this worker exits.
+                // held only across recv(); when the prep pool finishes and drops
+                // its senders, recv() returns Err and this worker exits.
+                let t0 = Instant::now();
                 let prepared = {
-                    let guard = rx.lock().expect("batch channel mutex poisoned");
-                    match guard.recv() {
-                        Ok(p) => p,
-                        Err(_) => break,
-                    }
+                    let guard = prep_rx.lock().expect("prepared batch channel mutex poisoned");
+                    guard.recv()
+                };
+                stats.recv_wait += t0.elapsed();
+                let prepared = match prepared {
+                    Ok(p) => p,
+                    Err(_) => break,
                 };
 
                 stats.batches += 1;
                 stats.reads += prepared.num_reads;
                 let num_gpu_pairs = prepared.pair_query_idx.len();
 
-                info!("Device {}: processing batch of {} reads, {} GPU pairs ({} both-filtered)",
+                info!("Device {}: aligning batch of {} reads, {} GPU pairs ({} both-filtered)",
                       device_id, prepared.num_reads, num_gpu_pairs, prepared.kmer_fail_count);
 
-                let (rows, cpu_fallbacks) = process_batch(
+                // GPU work only: upload, launch, synchronize, download.
+                let t1 = Instant::now();
+                let (scores, cigar_ops, cigar_lengths) = run_gpu_alignment(
                     &stream, &kernel, &prepared,
                     &d_refs, &d_ref_lengths, &d_ref_offsets,
-                    references_arc.as_slice(), &header_tags,
                     gap_open, gap_extend, mismatch,
                     max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
-                    skip_fail,
                 )?;
-                stats.cpu_fallbacks += cpu_fallbacks;
+                stats.gpu_busy += t1.elapsed();
 
-                if cpu_fallbacks > 0 {
-                    info!("Device {}: CPU fallback used for {} pairs in this batch",
-                          device_id, cpu_fallbacks);
+                // Hand the raw results to the post pool and immediately loop back
+                // for the next batch; formatting and CPU fallback happen off this
+                // thread so the GPU is not left idle.
+                let t2 = Instant::now();
+                let result = GpuBatchResult { prepared, scores, cigar_ops, cigar_lengths };
+                if post_tx.send(result).is_err() {
+                    break; // post pool all exited
                 }
-
-                // Write this batch's rows atomically so that all rows for a given
-                // read stay contiguous in the output.
-                {
-                    let mut w = writer.lock().expect("writer mutex poisoned");
-                    for row in &rows {
-                        w.write_record(row)?;
-                    }
-                    w.flush()?;
-                }
+                stats.send_wait += t2.elapsed();
             }
 
             Ok(stats)
         });
         worker_handles.push(handle);
     }
+    // Only the GPU workers hold post senders now.
+    drop(post_tx);
 
-    // Drop main's handle to the receiver so that once every worker exits, the
-    // reader's channel closes (and a blocked send unblocks with an error).
-    drop(rx);
+    // --- Stage 4: post-processing pool ---
+    let mut post_handles = Vec::with_capacity(post_threads);
+    for _ in 0..post_threads {
+        let post_rx = Arc::clone(&post_rx);
+        let rows_tx = rows_tx.clone();
+        let references_arc = Arc::clone(&references_arc);
+        let header_tags = header_tags.clone();
+        let handle = thread::spawn(move || -> Result<(StageStats, usize)> {
+            let mut stats = StageStats::default();
+            let mut cpu_fallbacks = 0usize;
+            loop {
+                let t0 = Instant::now();
+                let result = {
+                    let guard = post_rx.lock().expect("post channel mutex poisoned");
+                    guard.recv()
+                };
+                stats.recv_wait += t0.elapsed();
+                let result = match result {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
 
-    // Collect results from all GPU workers.
-    let mut total_reads = 0usize;
-    let mut batch_count = 0u64;
-    let mut total_cpu_fallbacks = 0usize;
+                let t1 = Instant::now();
+                let (rows, fb) = format_batch_rows(
+                    &result,
+                    references_arc.as_slice(),
+                    &header_tags,
+                    gap_open, gap_extend, mismatch,
+                    max_score, skip_fail,
+                );
+                stats.busy += t1.elapsed();
+                stats.batches += 1;
+                cpu_fallbacks += fb;
+
+                let t2 = Instant::now();
+                if rows_tx.send(rows).is_err() {
+                    break; // writer exited
+                }
+                stats.send_wait += t2.elapsed();
+            }
+            Ok((stats, cpu_fallbacks))
+        });
+        post_handles.push(handle);
+    }
+    // Only the post threads hold row senders now.
+    drop(rows_tx);
+
+    // --- Stage 5: writer thread ---
+    let writer_handle = thread::spawn(move || -> Result<StageStats> {
+        let mut writer = writer;
+        let mut stats = StageStats::default();
+        // Flush periodically so output appears incrementally without paying a
+        // syscall per batch. This thread is off the GPU critical path.
+        let mut since_flush = 0u64;
+        loop {
+            let t0 = Instant::now();
+            let rows = rows_rx.recv();
+            stats.recv_wait += t0.elapsed();
+            let rows = match rows {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let t1 = Instant::now();
+            for row in &rows {
+                writer.write_record(row)?;
+            }
+            since_flush += 1;
+            if since_flush >= 32 {
+                writer.flush()?;
+                since_flush = 0;
+            }
+            stats.busy += t1.elapsed();
+            stats.batches += 1;
+        }
+        let t2 = Instant::now();
+        writer.flush()?;
+        stats.busy += t2.elapsed();
+        Ok(stats)
+    });
+
+    // ---- Collect results and per-stage timing from every thread ----
+    let mut gpu = WorkerStats::default();
     for (i, handle) in worker_handles.into_iter().enumerate() {
         let stats = handle.join()
             .map_err(|e| anyhow!("GPU worker thread {} panicked: {:?}", i, e))?
             .with_context(|| format!("GPU worker for device {} failed", device_ids[i]))?;
-        total_reads += stats.reads;
-        batch_count += stats.batches;
-        total_cpu_fallbacks += stats.cpu_fallbacks;
+        gpu.batches += stats.batches;
+        gpu.reads += stats.reads;
+        gpu.gpu_busy += stats.gpu_busy;
+        gpu.recv_wait += stats.recv_wait;
+        gpu.send_wait += stats.send_wait;
     }
 
-    // Wait for the CPU reader thread to finish.
-    cpu_thread.join()
-        .map_err(|e| anyhow!("CPU reader thread panicked: {:?}", e))?
-        .context("CPU reader thread failed")?;
+    let mut prep = StageStats::default();
+    for (i, handle) in prep_handles.into_iter().enumerate() {
+        let s = handle.join()
+            .map_err(|e| anyhow!("prep thread {} panicked: {:?}", i, e))?
+            .context("prep thread failed")?;
+        prep.merge(&s);
+    }
+
+    let mut post = StageStats::default();
+    let mut total_cpu_fallbacks = 0usize;
+    for (i, handle) in post_handles.into_iter().enumerate() {
+        let (s, fb) = handle.join()
+            .map_err(|e| anyhow!("post thread {} panicked: {:?}", i, e))?
+            .context("post thread failed")?;
+        post.merge(&s);
+        total_cpu_fallbacks += fb;
+    }
+
+    let reader_stats = reader_handle.join()
+        .map_err(|e| anyhow!("reader thread panicked: {:?}", e))?
+        .context("reader thread failed")?;
+
+    let writer_stats = writer_handle.join()
+        .map_err(|e| anyhow!("writer thread panicked: {:?}", e))?
+        .context("writer thread failed")?;
+
+    let wall = pipeline_start.elapsed();
 
     if total_cpu_fallbacks > 0 {
         info!("CPU fallback used for {} pairs total", total_cpu_fallbacks);
     }
     info!("Alignment completed. Processed {} reads in {} batches across {} device(s)",
-          total_reads, batch_count, num_devices);
+          gpu.reads, gpu.batches, num_devices);
+
+    log_pipeline_timing(
+        wall, &reader_stats, &prep, &gpu, &post, &writer_stats,
+        prep_threads, num_devices, post_threads,
+    );
+
     Ok(())
 }
 
-/// A batch that has been read from disk and pre-filtered by the CPU thread,
+/// A batch that has been read from disk and pre-filtered by a prep thread,
 /// ready for GPU alignment.
 struct PreparedBatch {
     batch: Vec<SequenceRecord>,
     query_data: Vec<i8>,
-    query_lengths: Vec<usize>,
-    query_offsets: Vec<usize>,
+    query_lengths: Vec<i32>,
+    query_offsets: Vec<i32>,
     rc_query_data: Vec<i8>,
-    rc_query_lengths: Vec<usize>,
-    rc_query_offsets: Vec<usize>,
+    rc_query_lengths: Vec<i32>,
+    rc_query_offsets: Vec<i32>,
     fwd_kmer_pass: Vec<bool>,
     rc_kmer_pass: Vec<bool>,
     kmer_fail_count: usize,
@@ -508,12 +602,48 @@ struct PreparedBatch {
     num_refs: usize,
 }
 
-/// Per-worker counters aggregated after all GPU threads finish.
-#[derive(Default)]
+/// GPU-computed alignment results for one batch, awaiting CPU-side formatting
+/// (and, for pairs over the score budget, CPU fallback). Produced by a GPU
+/// worker, consumed by a post-processing thread.
+struct GpuBatchResult {
+    prepared: PreparedBatch,
+    scores: Vec<i32>,
+    cigar_ops: Vec<Vec<i8>>,
+    cigar_lengths: Vec<i32>,
+}
+
+/// Per-GPU-worker counters, aggregated after all GPU threads finish. The three
+/// durations partition each worker's wall time: `gpu_busy` doing GPU work,
+/// `recv_wait` blocked waiting for a batch (upstream starvation), and
+/// `send_wait` blocked handing results downstream (downstream backpressure).
+#[derive(Default, Clone)]
 struct WorkerStats {
     batches: u64,
     reads: usize,
-    cpu_fallbacks: usize,
+    gpu_busy: Duration,
+    recv_wait: Duration,
+    send_wait: Duration,
+}
+
+/// Wall-time breakdown accumulated by one CPU pipeline stage. `busy` is time
+/// doing useful work; `recv_wait` is time blocked waiting for input (upstream
+/// can't keep up); `send_wait` is time blocked handing output downstream
+/// (downstream can't keep up).
+#[derive(Default, Clone)]
+struct StageStats {
+    busy: Duration,
+    recv_wait: Duration,
+    send_wait: Duration,
+    batches: u64,
+}
+
+impl StageStats {
+    fn merge(&mut self, other: &StageStats) {
+        self.busy += other.busy;
+        self.recv_wait += other.recv_wait;
+        self.send_wait += other.send_wait;
+        self.batches += other.batches;
+    }
 }
 
 /// Results from a GPU kernel launch
@@ -523,21 +653,204 @@ struct KernelResults {
     cigar_lengths: Vec<i32>,
 }
 
-/// Run GPU alignment for one prepared batch on the given device stream/kernel,
-/// then format the output rows. Returns the rows (one per read×reference pair)
-/// and the number of pairs that fell back to the CPU aligner.
+/// Log the per-stage timing breakdown and a one-line diagnosis of where the
+/// GPUs spend their time. The `busy`/`recv-wait`/`send-wait` split for the GPU
+/// stage answers "are the GPUs starving, blocked, or actually working?".
+fn log_pipeline_timing(
+    wall: Duration,
+    reader: &StageStats,
+    prep: &StageStats,
+    gpu: &WorkerStats,
+    post: &StageStats,
+    writer: &StageStats,
+    prep_threads: usize,
+    num_devices: usize,
+    post_threads: usize,
+) {
+    let s = |d: Duration| d.as_secs_f64();
+
+    info!("=== Pipeline timing (wall {:.1}s | 1 reader, {} prep, {} GPU, {} post, 1 writer) ===",
+          s(wall), prep_threads, num_devices, post_threads);
+    info!("  reader : busy {:.1}s  send-wait {:.1}s  ({} batches)",
+          s(reader.busy), s(reader.send_wait), reader.batches);
+    info!("  prep   : busy {:.1}s  recv-wait {:.1}s  send-wait {:.1}s  (summed over {} threads)",
+          s(prep.busy), s(prep.recv_wait), s(prep.send_wait), prep_threads);
+    info!("  gpu    : busy {:.1}s  recv-wait {:.1}s  send-wait {:.1}s  (summed over {} threads)",
+          s(gpu.gpu_busy), s(gpu.recv_wait), s(gpu.send_wait), num_devices);
+    info!("  post   : busy {:.1}s  recv-wait {:.1}s  send-wait {:.1}s  (summed over {} threads)",
+          s(post.busy), s(post.recv_wait), s(post.send_wait), post_threads);
+    info!("  writer : busy {:.1}s  recv-wait {:.1}s",
+          s(writer.busy), s(writer.recv_wait));
+
+    let gpu_total = gpu.gpu_busy + gpu.recv_wait + gpu.send_wait;
+    if gpu_total.as_secs_f64() > 0.0 {
+        let busy = 100.0 * s(gpu.gpu_busy) / s(gpu_total);
+        let starve = 100.0 * s(gpu.recv_wait) / s(gpu_total);
+        let backpr = 100.0 * s(gpu.send_wait) / s(gpu_total);
+        info!("  GPU time split: {:.0}% aligning, {:.0}% starved (waiting for input), {:.0}% blocked (waiting on post/writer)",
+              busy, starve, backpr);
+        if starve > 20.0 {
+            warn!("GPUs starved {:.0}% of the time — the reader/prep stages can't keep up. \
+                   Try raising --prep-threads (now {}) or --batch-size, or pre-decompressing the input.",
+                  starve, prep_threads);
+        } else if backpr > 20.0 {
+            warn!("GPUs blocked {:.0}% of the time waiting on downstream — post/writer can't keep up. \
+                   Try raising --post-threads (now {}).",
+                  backpr, post_threads);
+        }
+    }
+}
+
+// ============================================================
+// Batch preparation (runs on the prep pool)
+// ============================================================
+
+/// Turn a raw batch of reads into a `PreparedBatch`: generate reverse
+/// complements, pack both orientations for GPU upload, run the k-mer pre-filter,
+/// and build the per-pair index lists. This is the CPU-heavy work that runs in
+/// parallel across the prep pool so it does not starve the GPUs.
+fn prepare_batch(
+    batch: Vec<SequenceRecord>,
+    references: &[SequenceRecord],
+    ref_kmer_sets: &[HashSet<Vec<u8>>],
+    kmer_filter_enabled: bool,
+    kmer_length: usize,
+    kmer_threshold: f64,
+) -> PreparedBatch {
+    let num_reads = batch.len();
+    let num_refs = references.len();
+    let num_pairs = num_reads * num_refs;
+
+    // Generate reverse complement sequences for each read
+    let rc_seqs: Vec<Vec<u8>> = batch.iter()
+        .map(|rec| reverse_complement(&rec.seq))
+        .collect();
+
+    // Pack forward and reverse-complement query sequences for GPU upload,
+    // converting lengths/offsets to i32 here so the GPU worker uploads directly.
+    let (query_data, query_lengths_us, query_offsets_us) = pack_sequences(&batch);
+    let (rc_query_data, rc_query_lengths_us, rc_query_offsets_us) = pack_sequences_raw(&rc_seqs);
+    let query_lengths: Vec<i32> = query_lengths_us.iter().map(|&x| x as i32).collect();
+    let query_offsets: Vec<i32> = query_offsets_us.iter().map(|&x| x as i32).collect();
+    let rc_query_lengths: Vec<i32> = rc_query_lengths_us.iter().map(|&x| x as i32).collect();
+    let rc_query_offsets: Vec<i32> = rc_query_offsets_us.iter().map(|&x| x as i32).collect();
+
+    // Run k-mer pre-filter for both orientations
+    let mut fwd_kmer_pass = vec![true; num_pairs];
+    let mut rc_kmer_pass = vec![true; num_pairs];
+    let mut kmer_fail_count = 0usize;
+
+    if kmer_filter_enabled {
+        for qi in 0..num_reads {
+            let fwd_kmers = collect_kmers_owned(&batch[qi].seq, kmer_length);
+            let rc_kmers = collect_kmers_owned(&rc_seqs[qi], kmer_length);
+
+            for ri in 0..num_refs {
+                let global_idx = qi * num_refs + ri;
+
+                // Check forward orientation
+                if !fwd_kmers.is_empty() {
+                    let hits = fwd_kmers.iter()
+                        .filter(|km| ref_kmer_sets[ri].contains(km.as_slice()))
+                        .count();
+                    let fraction = hits as f64 / fwd_kmers.len() as f64;
+                    if fraction < kmer_threshold {
+                        fwd_kmer_pass[global_idx] = false;
+                    }
+                }
+
+                // Check reverse complement orientation
+                if !rc_kmers.is_empty() {
+                    let hits = rc_kmers.iter()
+                        .filter(|km| ref_kmer_sets[ri].contains(km.as_slice()))
+                        .count();
+                    let fraction = hits as f64 / rc_kmers.len() as f64;
+                    if fraction < kmer_threshold {
+                        rc_kmer_pass[global_idx] = false;
+                    }
+                }
+
+                // Count pairs where BOTH orientations fail
+                if !fwd_kmer_pass[global_idx] && !rc_kmer_pass[global_idx] {
+                    kmer_fail_count += 1;
+                }
+            }
+        }
+    }
+
+    // Build pair indices for passing pairs (both orientations)
+    let mut pair_query_idx = Vec::with_capacity(num_pairs * 2);
+    let mut pair_ref_idx = Vec::with_capacity(num_pairs * 2);
+    let mut pair_is_rc = Vec::with_capacity(num_pairs * 2);
+
+    // Forward pairs
+    let mut fwd_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
+    for qi in 0..num_reads {
+        for ri in 0..num_refs {
+            let global_idx = qi * num_refs + ri;
+            if fwd_kmer_pass[global_idx] {
+                fwd_gpu_idx[global_idx] = Some(pair_query_idx.len());
+                pair_query_idx.push(qi as i32);
+                pair_ref_idx.push(ri as i32);
+                pair_is_rc.push(false);
+            }
+        }
+    }
+
+    // RC pairs
+    let mut rc_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
+    for qi in 0..num_reads {
+        for ri in 0..num_refs {
+            let global_idx = qi * num_refs + ri;
+            if rc_kmer_pass[global_idx] {
+                rc_gpu_idx[global_idx] = Some(pair_query_idx.len());
+                pair_query_idx.push(qi as i32);
+                pair_ref_idx.push(ri as i32);
+                pair_is_rc.push(true);
+            }
+        }
+    }
+
+    PreparedBatch {
+        batch,
+        query_data,
+        query_lengths,
+        query_offsets,
+        rc_query_data,
+        rc_query_lengths,
+        rc_query_offsets,
+        fwd_kmer_pass,
+        rc_kmer_pass,
+        kmer_fail_count,
+        pair_query_idx,
+        pair_ref_idx,
+        pair_is_rc,
+        fwd_gpu_idx,
+        rc_gpu_idx,
+        num_reads,
+        num_refs,
+    }
+}
+
+// ============================================================
+// GPU alignment (runs on the GPU worker threads)
+// ============================================================
+
+/// Run GPU alignment for one prepared batch on the given device stream/kernel.
+/// Returns the per-GPU-pair scores, CIGAR ops, and CIGAR lengths (indexed by the
+/// pair's position in `prepared.pair_*`). This performs only GPU work (upload,
+/// kernel launch, synchronize, download); output formatting and CPU fallback are
+/// done later on a post-processing thread.
 ///
 /// This is invoked from each GPU worker thread; `stream`, `kernel`, and the
 /// `d_ref*` slices all belong to that worker's device context.
-fn process_batch(
+fn run_gpu_alignment(
     stream: &Arc<cudarc::driver::CudaStream>,
     kernel: &cudarc::driver::CudaFunction,
     prepared: &PreparedBatch,
     d_refs: &CudaSlice<i8>,
     d_ref_lengths: &CudaSlice<i32>,
     d_ref_offsets: &CudaSlice<i32>,
-    references: &[SequenceRecord],
-    header_tags: &[String],
     gap_open: i32,
     gap_extend: i32,
     mismatch: i32,
@@ -546,20 +859,18 @@ fn process_batch(
     max_score: usize,
     max_cigar_len: usize,
     max_gpu_pairs: usize,
-    skip_fail: bool,
-) -> Result<(Vec<Vec<String>>, usize)> {
-    let num_refs = prepared.num_refs;
+) -> Result<(Vec<i32>, Vec<Vec<i8>>, Vec<i32>)> {
     let num_gpu_pairs = prepared.pair_query_idx.len();
 
-    // Upload forward query data to GPU
+    // Upload forward query data to GPU (lengths/offsets already i32)
     let d_fwd_queries = stream.memcpy_stod(&prepared.query_data)?;
-    let d_fwd_query_lengths = stream.memcpy_stod(&prepared.query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-    let d_fwd_query_offsets = stream.memcpy_stod(&prepared.query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+    let d_fwd_query_lengths = stream.memcpy_stod(&prepared.query_lengths)?;
+    let d_fwd_query_offsets = stream.memcpy_stod(&prepared.query_offsets)?;
 
     // Upload RC query data to GPU
     let d_rc_queries = stream.memcpy_stod(&prepared.rc_query_data)?;
-    let d_rc_query_lengths = stream.memcpy_stod(&prepared.rc_query_lengths.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-    let d_rc_query_offsets = stream.memcpy_stod(&prepared.rc_query_offsets.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
+    let d_rc_query_lengths = stream.memcpy_stod(&prepared.rc_query_lengths)?;
+    let d_rc_query_offsets = stream.memcpy_stod(&prepared.rc_query_offsets)?;
 
     // Collect GPU results
     let mut all_scores = vec![0i32; num_gpu_pairs];
@@ -627,7 +938,34 @@ fn process_batch(
         }
     }
 
-    // Build output: for each read×ref pair, pick the best orientation
+    Ok((all_scores, all_cigar_ops, all_cigar_lengths))
+}
+
+// ============================================================
+// Output formatting + CPU fallback (runs on the post pool)
+// ============================================================
+
+/// Build the TSV output rows for one batch from its GPU results. For each
+/// read×reference pair, pick the best orientation; pairs the GPU could not
+/// resolve within the score budget are transparently re-aligned on the CPU here.
+/// Returns the rows (one per pair, unless filtered/skipped) and the number of
+/// CPU fallbacks performed. Runs on a post-processing thread, off the GPU path.
+fn format_batch_rows(
+    result: &GpuBatchResult,
+    references: &[SequenceRecord],
+    header_tags: &[String],
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+    max_score: usize,
+    skip_fail: bool,
+) -> (Vec<Vec<String>>, usize) {
+    let prepared = &result.prepared;
+    let all_scores = &result.scores;
+    let all_cigar_ops = &result.cigar_ops;
+    let all_cigar_lengths = &result.cigar_lengths;
+    let num_refs = prepared.num_refs;
+
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut cpu_fallback_count = 0usize;
     for qi in 0..prepared.num_reads {
@@ -755,7 +1093,7 @@ fn process_batch(
         }
     }
 
-    Ok((rows, cpu_fallback_count))
+    (rows, cpu_fallback_count)
 }
 
 /// Launch the WFA alignment kernel for a set of pairs, handling sub-batching for GPU memory.

@@ -14,7 +14,7 @@ The code in this repo was written by an AI assistant (claude opus) under guidanc
 - **Affine gap penalties** — configurable mismatch, gap-open, and gap-extension costs
 - **FASTA & FASTQ input** — auto-detected format, with transparent gzip/bzip2/xz decompression via [niffler](https://crates.io/crates/niffler)
 - **K-mer pre-filter** — optional k-mer overlap check skips unlikely alignments before they reach the GPU, saving compute (applied independently to both orientations)
-- **Double-buffered pipeline** — a background CPU thread reads and pre-filters the next batch while the GPU aligns the current one
+- **Fully pipelined, multi-stage architecture** — disk reading, batch preparation (reverse-complement, packing, k-mer filtering), GPU alignment, CPU fallback + output formatting, and TSV writing each run on their own thread(s) connected by bounded queues, so a GPU never blocks on CPU work or I/O. Preparation and post-processing are parallelized across CPU cores (tunable via `--prep-threads` / `--post-threads`) to keep every GPU fed. A per-stage timing summary (at `-v`) reports whether the GPUs are starving, blocked, or fully busy.
 - **Automatic GPU memory management** — queries available VRAM and splits work into sub-batches to avoid out-of-memory errors
 - **CPU fallback** — pairs that exceed the GPU score budget are transparently re-aligned on the CPU
 - **Header tag extraction** — arbitrary tags (e.g. `RG:Z:`) can be pulled from read headers and included as extra output columns
@@ -84,6 +84,8 @@ blep -r reads.fastq.gz -R references.fasta -o results.tsv -v
 | | `--max-ref-length` | `500` | Maximum reference length (for GPU memory pre-allocation) |
 | | `--max-score` | `256` | Score budget on GPU; pairs exceeding this fall back to CPU |
 | | `--devices` | all GPUs | Comma-separated CUDA device indices to use (e.g. `0,1,2`); defaults to every available device |
+| | `--prep-threads` | `0` (auto) | Number of CPU threads that prepare batches (reverse-complement, packing, k-mer filter) before the GPUs. This is the stage most likely to starve the GPUs. Auto ≈ hardware threads minus GPU workers |
+| | `--post-threads` | `0` (auto) | Number of CPU threads that post-process GPU results (CPU fallback + output formatting) off the GPU worker threads. Auto ≈ number of GPUs |
 | `-k` | `--kmer-length` | `0` (off) | K-mer length for the pre-alignment filter |
 | `-t` | `--kmer-threshold` | `0.5` | Minimum fraction of shared k-mers to proceed with alignment |
 | | `--header-tag` | — | Tag prefix to extract from read headers (repeatable) |
@@ -131,31 +133,45 @@ blep -r reads.fastq -R refs.fasta --header-tag "RG:Z:" -o out.tsv
 ### Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  CPU Reader Thread (background)                                │
-│  ┌───────────┐   ┌────────────┐   ┌──────────────┐            │
-│  │ Read batch│──▶│ Generate   │──▶│ K-mer filter │──▶ Batch   │
-│  │ from disk │   │ rev. comp. │   │ (fwd + RC)   │      │      │
-│  └───────────┘   └────────────┘   └──────────────┘      │      │
-└─────────────────────────────────────────────────────────┼──────┘
-                                                          │ shared queue
-                                        ┌─────────────────┼─────────────────┐
-                                        ▼                 ▼                 ▼
-                              ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-                              │ GPU Worker 0 │  │ GPU Worker 1 │  │ GPU Worker N │
-                              │ upload→WFA→  │  │ upload→WFA→  │  │ upload→WFA→  │
-                              │ download→best│  │ download→best│  │ download→best│
-                              └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-                                     └─────────────────┼─────────────────┘
-                                                       ▼
-                                          ┌─────────────────────────┐
-                                          │ TSV writer (mutex-guarded)│
-                                          └─────────────────────────┘
+┌───────────┐   raw batches   ┌───────────────────────────────────┐
+│  Reader   │────────────────▶│  Prep pool  (P threads)           │
+│  thread   │  (bounded queue) │  rev-comp · pack · k-mer filter   │
+└───────────┘                  └──────────────────┬────────────────┘
+                                                   │ prepared batches (bounded queue)
+                         ┌─────────────────────────┼─────────────────────────┐
+                         ▼                         ▼                         ▼
+               ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+               │ GPU Worker 0 │          │ GPU Worker 1 │   ...    │ GPU Worker N │
+               │ upload→WFA→  │          │ upload→WFA→  │          │ upload→WFA→  │
+               │ download     │          │ download     │          │ download     │
+               └──────┬───────┘          └──────┬───────┘          └──────┬───────┘
+                      └─────────────────────────┼─────────────────────────┘
+                                                │ GPU results (bounded queue)
+                                ┌───────────────┴────────────────┐
+                                ▼                                ▼
+                       ┌──────────────┐                 ┌──────────────┐
+                       │  Post pool   │      ...        │  Post pool   │
+                       │ CPU fallback │                 │ + row format │
+                       └──────┬───────┘                 └──────┬───────┘
+                              └───────────────┬────────────────┘
+                                              │ formatted rows (bounded queue)
+                                       ┌──────▼───────┐
+                                       │ Writer thread│
+                                       │ (TSV output) │
+                                       └──────────────┘
 ```
 
-The pipeline is **pipelined and data-parallel**: a single background CPU thread reads, reverse-complements, and k-mer-filters batches, then hands each prepared batch to whichever GPU worker is free. Each worker owns its own CUDA context, kernel module, and reference copy, and processes an entire batch independently. Communication uses a bounded `mpsc::sync_channel(num_devices * 2)` whose receiver is shared across workers behind a `Mutex` (an MPMC queue built on std's MPSC).
+The pipeline is **fully decoupled and data-parallel**. Each stage runs on its own thread(s) and is connected to the next by a bounded `mpsc::sync_channel`; the pooled stages (prep, GPU workers, post) share their channel's receiver behind a `Mutex`, giving an MPMC queue built on std's MPSC. The design deliberately keeps CPU work off the GPU threads:
 
-**Output ordering:** each batch's rows are written under a single lock acquisition, so all rows for a given read stay contiguous. However, because batches finish on whichever GPU is free first, the relative order of batches in the output is not guaranteed to match the input order when more than one device is used. Sort downstream if a stable order is required.
+- **Reader** (1 thread) only reads raw batches from disk.
+- **Prep pool** (`--prep-threads`, auto ≈ cores − GPUs) reverse-complements, packs, and k-mer-filters batches in parallel. This is the heaviest CPU stage and the one most likely to starve the GPUs, hence a pool.
+- **GPU workers** (one per device) do *only* GPU work — upload, kernel launch, synchronize, download — then hand the raw results downstream and immediately pull the next batch. Each owns its own CUDA context, kernel module, and reference copy.
+- **Post pool** (`--post-threads`) runs the CPU fallback aligner (for pairs over the score budget) and formats output rows, so a GPU is never blocked re-aligning or formatting.
+- **Writer** (1 thread) serializes rows to the output TSV, flushing periodically.
+
+Because the GPU workers never touch disk, the CPU fallback, formatting, or the writer lock, they stay busy as long as the prep pool can keep the prepared-batch queue full. Run with `-v` to get a per-stage timing summary that reports what fraction of GPU time was spent aligning vs. starved (waiting for input) vs. blocked (waiting on downstream), plus a hint on which knob to turn.
+
+**Output ordering:** each batch's rows are written together, so all rows for a given read stay contiguous. However, because batches flow through parallel prep, GPU, and post stages, the relative order of batches in the output is not guaranteed to match the input order. Sort downstream if a stable order is required.
 
 ### Reverse complement alignment
 
@@ -192,7 +208,7 @@ Before launching kernels, each GPU worker queries its own device's available VRA
 
 ### CPU fallback
 
-If a pair's alignment score exceeds `--max-score` on the GPU (the kernel returns score = −1), blep transparently re-aligns that pair on the CPU using a pure-Rust WFA implementation in [`src/main.rs`](src/main.rs:554).
+If a pair's alignment score exceeds `--max-score` on the GPU (the kernel returns score = −1), blep transparently re-aligns that pair on the CPU using a pure-Rust WFA implementation (`cpu_align` in [`src/main.rs`](src/main.rs)). This runs on the post-processing pool, not the GPU worker threads, so a batch full of over-budget pairs does not stall a GPU.
 
 ### Dependencies
 
