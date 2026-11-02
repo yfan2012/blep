@@ -11,6 +11,18 @@
 //   diagonal k = query_pos - ref_pos
 //   offset = ref_pos (furthest reference position reached on diagonal k)
 //   query_pos = offset + k
+//
+// Work bounding:
+//   - Rows are initialised lazily: row s of every array is set to EMPTY at the
+//     start of score iteration s, so a pair that finishes at score S touches
+//     S+1 rows instead of the whole (max_score+1)-row workspace. The host may
+//     therefore hand the kernel a workspace holding stale data from earlier
+//     launches; nothing is ever read from a row that was not initialised in the
+//     current launch.
+//   - Every k-changing transition costs at least gap_extend, so at score s only
+//     diagonals |k| <= s / gap_extend can be populated. Loops over a row are
+//     restricted to that band. Cells outside it are EMPTY by construction, so
+//     the results are identical to scanning the full row.
 
 #define EMPTY (-2)
 
@@ -40,12 +52,23 @@ __device__ __forceinline__ void unpack_bt(int packed, int* op, int* src_comp, in
     *prev_k = ((packed >> 16) & 0xFFFF) - max_k;
 }
 
+// Half-width of the band of diagonals that can be populated at score s.
+__device__ __forceinline__ int band_half(int s, int gap_extend, int max_k) {
+    if (gap_extend <= 0) return max_k;
+    int h = s / gap_extend;
+    return h < max_k ? h : max_k;
+}
+
 // WFA alignment kernel.
 //
 // The host allocates a workspace buffer per thread of size:
 //   3 * (max_score + 1) * num_diags ints  (for M, I, D wavefronts)
 //   + (max_score + 1) * num_diags ints    (for backtrack)
 // where num_diags = 2 * max_k + 1, max_k = max(max_read_len, max_ref_len)
+//
+// The workspace does not need to be zeroed by the host: rows are initialised
+// lazily inside the kernel (see the header comment), so one allocation can be
+// reused across launches.
 //
 // workspace layout per thread (all int32):
 //   [0 .. S*D)                         = wf_m[score][diag]
@@ -98,11 +121,6 @@ extern "C" __global__ void wfa_align_kernel(
     int* wf_d = my_ws + 2L * S * D;
     int* bt_m = my_ws + 3L * S * D;
 
-    // Initialize all wavefronts to EMPTY
-    for (long i = 0; i < 4L * S * D; i++) {
-        my_ws[i] = EMPTY;
-    }
-
     // Output buffer
     char* my_cigar = out_cigars + (long)tid * max_cigar_len;
 
@@ -113,7 +131,19 @@ extern "C" __global__ void wfa_align_kernel(
     #define WF_D(s, k) wf_d[WF_IDX(s, k)]
     #define BT_M(s, k) bt_m[WF_IDX(s, k)]
 
+    // Lazily initialise row s of all four arrays to EMPTY.
+    #define INIT_ROW(s) do {                                   \
+        long base_ = (long)(s) * D;                            \
+        for (int ki_ = 0; ki_ < (int)D; ki_++) {               \
+            wf_m[base_ + ki_] = EMPTY;                         \
+            wf_i[base_ + ki_] = EMPTY;                         \
+            wf_d[base_ + ki_] = EMPTY;                         \
+            bt_m[base_ + ki_] = EMPTY;                         \
+        }                                                      \
+    } while (0)
+
     // Initialize score 0
+    INIT_ROW(0);
     WF_M(0, 0) = 0;
 
     // Extend score 0
@@ -145,11 +175,17 @@ extern "C" __global__ void wfa_align_kernel(
     int final_score = -1;
 
     for (int s = 1; s <= max_score; s++) {
+        INIT_ROW(s);
+        const int hs = band_half(s, gap_extend, max_k);
+        const int lo_s = max_k - hs;
+        const int hi_s = max_k + hs;
+
         // --- Insertions (gap in reference, query advances) ---
         // k increases by 1, offset stays
         int ins_s = s - gap_open - gap_extend;
         if (ins_s >= 0) {
-            for (int ki = 0; ki < (int)D; ki++) {
+            int h = band_half(ins_s, gap_extend, max_k);
+            for (int ki = max_k - h; ki <= max_k + h; ki++) {
                 int prev_off = wf_m[ins_s * D + ki];
                 if (prev_off == EMPTY) continue;
                 int k = ki - max_k;
@@ -168,7 +204,8 @@ extern "C" __global__ void wfa_align_kernel(
         // Insertion extensions (from I at s - gap_extend)
         int ins_ext_s = s - gap_extend;
         if (ins_ext_s >= 0) {
-            for (int ki = 0; ki < (int)D; ki++) {
+            int h = band_half(ins_ext_s, gap_extend, max_k);
+            for (int ki = max_k - h; ki <= max_k + h; ki++) {
                 int prev_off = wf_i[ins_ext_s * D + ki];
                 if (prev_off == EMPTY) continue;
                 int k = ki - max_k;
@@ -186,7 +223,8 @@ extern "C" __global__ void wfa_align_kernel(
         // k decreases by 1, offset increases by 1
         int del_s = s - gap_open - gap_extend;
         if (del_s >= 0) {
-            for (int ki = 0; ki < (int)D; ki++) {
+            int h = band_half(del_s, gap_extend, max_k);
+            for (int ki = max_k - h; ki <= max_k + h; ki++) {
                 int prev_off = wf_m[del_s * D + ki];
                 if (prev_off == EMPTY) continue;
                 int k = ki - max_k;
@@ -204,7 +242,8 @@ extern "C" __global__ void wfa_align_kernel(
         // Deletion extensions (from D at s - gap_extend)
         int del_ext_s = s - gap_extend;
         if (del_ext_s >= 0) {
-            for (int ki = 0; ki < (int)D; ki++) {
+            int h = band_half(del_ext_s, gap_extend, max_k);
+            for (int ki = max_k - h; ki <= max_k + h; ki++) {
                 int prev_off = wf_d[del_ext_s * D + ki];
                 if (prev_off == EMPTY) continue;
                 int k = ki - max_k;
@@ -222,7 +261,8 @@ extern "C" __global__ void wfa_align_kernel(
         // --- Mismatches (from M at s - mismatch) ---
         int sub_s = s - mismatch_penalty;
         if (sub_s >= 0) {
-            for (int ki = 0; ki < (int)D; ki++) {
+            int h = band_half(sub_s, gap_extend, max_k);
+            for (int ki = max_k - h; ki <= max_k + h; ki++) {
                 int prev_off = wf_m[sub_s * D + ki];
                 if (prev_off == EMPTY) continue;
                 int k = ki - max_k;
@@ -239,7 +279,7 @@ extern "C" __global__ void wfa_align_kernel(
         }
 
         // --- Merge I and D into M ---
-        for (int ki = 0; ki < (int)D; ki++) {
+        for (int ki = lo_s; ki <= hi_s; ki++) {
             int i_off = wf_i[s * D + ki];
             if (i_off != EMPTY && i_off > wf_m[s * D + ki]) {
                 wf_m[s * D + ki] = i_off;
@@ -270,7 +310,7 @@ extern "C" __global__ void wfa_align_kernel(
         }
 
         // --- Extend M wavefront ---
-        for (int ki = 0; ki < (int)D; ki++) {
+        for (int ki = lo_s; ki <= hi_s; ki++) {
             int offset = wf_m[s * D + ki];
             if (offset == EMPTY) continue;
             int k = ki - max_k;
@@ -380,6 +420,7 @@ extern "C" __global__ void wfa_align_kernel(
     out_scores[tid] = final_score;
     out_cigar_lengths[tid] = out_len;
 
+    #undef INIT_ROW
     #undef WF_IDX
     #undef WF_M
     #undef WF_I

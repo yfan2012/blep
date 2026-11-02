@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::fs::File;
 use std::io::{self, Read, BufReader};
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
 use std::sync::mpsc;
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, Context, anyhow, ensure};
 use clap::Parser;
 use bio::io::{fasta, fastq};
 use bio::io::fasta::FastaRead;
@@ -46,15 +48,19 @@ struct Args {
     #[clap(short = 'm', long, default_value = "4")]
     mismatch: i32,
 
-    /// Batch size for processing reads (number of reads to load at once)
+    /// Batch size for processing reads (number of reads to load at once).
+    /// Reads are deduplicated within a batch, so larger batches collapse more
+    /// duplicates.
     #[clap(short = 'b', long, default_value = "10000")]
     batch_size: usize,
 
-    /// Maximum read length (for GPU memory pre-allocation)
+    /// Maximum read length (for GPU memory pre-allocation). Longer reads are
+    /// not aligned; they are reported with cigar `*` and counted in a warning.
     #[clap(long, default_value = "500")]
     max_read_length: usize,
 
-    /// Maximum reference length (for GPU memory pre-allocation)
+    /// Maximum reference length (for GPU memory pre-allocation). A longer
+    /// reference is an error at startup.
     #[clap(long, default_value = "500")]
     max_ref_length: usize,
 
@@ -68,9 +74,10 @@ struct Args {
     #[clap(long, value_delimiter = ',')]
     devices: Option<Vec<usize>>,
 
-    /// Number of CPU threads that prepare batches (reverse-complement, packing,
-    /// and the k-mer pre-filter) before they reach the GPUs. This preparation is
-    /// the stage most likely to starve the GPUs, so it runs as a parallel pool.
+    /// Number of CPU threads that prepare batches (deduplication,
+    /// reverse-complement, packing, and the k-mer pre-filter) before they reach
+    /// the GPUs. This preparation is the stage most likely to starve the GPUs,
+    /// so it runs as a parallel pool.
     /// 0 = auto (roughly all hardware threads not reserved for GPU workers).
     #[clap(long, default_value = "0")]
     prep_threads: usize,
@@ -81,8 +88,9 @@ struct Args {
     #[clap(long, default_value = "0")]
     post_threads: usize,
 
-    /// K-mer length for the pre-alignment filter. When set (> 0), unique k-mers
-    /// of the read are checked against the reference before running WFA.
+    /// K-mer length for the pre-alignment filter (1-32). When set (> 0), unique
+    /// k-mers of the read are checked against the reference before running WFA.
+    /// K-mers containing a non-ACGT base are ignored.
     #[clap(short = 'k', long, default_value = "0")]
     kmer_length: usize,
 
@@ -105,6 +113,19 @@ struct Args {
     #[clap(long)]
     skip_fail: bool,
 
+    /// Disable within-batch read deduplication. By default, reads with identical
+    /// sequences in a batch are aligned once and the result is reused for every
+    /// copy. Deduplication is lossless, so this flag exists only for A/B checks.
+    #[clap(long)]
+    no_dedup: bool,
+
+    /// Collapse the output: emit one row per (read sequence, header-tag values)
+    /// group instead of one row per read, with a trailing `n_reads` column
+    /// giving the number of reads in the group. `read_name` is the first read
+    /// of the group. Groups are formed within a batch.
+    #[clap(long)]
+    collapse: bool,
+
     /// Verbosity level
     #[clap(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -115,6 +136,15 @@ const OP_MATCH: u8 = 0;
 const OP_MISMATCH: u8 = 1;
 const OP_INSERTION: u8 = 2;
 const OP_DELETION: u8 = 3;
+
+/// Longest k-mer that fits the 2-bit packed `u64` representation.
+const MAX_KMER_LEN: usize = 32;
+
+/// Score cap for the CPU fallback aligner.
+const CPU_MAX_SCORE: i32 = 4096;
+
+/// Sentinel for an unset wavefront offset (matches the kernel's EMPTY).
+const WF_EMPTY: i32 = -2;
 
 /// A sequence record with ID, sequence, and optional header description
 #[derive(Debug, Clone)]
@@ -141,10 +171,24 @@ fn main() -> Result<()> {
           args.max_read_length, args.max_ref_length, args.max_score);
     info!("Reverse complement alignment: enabled (always-on)");
 
+    if args.kmer_length > MAX_KMER_LEN {
+        return Err(anyhow!("--kmer-length must be <= {} (got {})", MAX_KMER_LEN, args.kmer_length));
+    }
     let kmer_filter_enabled = args.kmer_length > 0;
     if kmer_filter_enabled {
         info!("K-mer pre-filter enabled: k={}, threshold={:.2}",
               args.kmer_length, args.kmer_threshold);
+    }
+
+    let dedup = !args.no_dedup;
+    let collapse = args.collapse;
+    if dedup {
+        info!("Read deduplication: enabled (identical sequences within a batch are aligned once)");
+    } else {
+        info!("Read deduplication: disabled (--no-dedup)");
+    }
+    if collapse {
+        info!("Output: collapsed to one row per (sequence, header tags) group with an n_reads column");
     }
 
     let header_tags = args.header_tags.clone();
@@ -175,11 +219,24 @@ fn main() -> Result<()> {
     // Read reference sequences (shared read-only across all GPU workers).
     info!("Reading reference sequences from {}", args.references.display());
     let references = read_sequences_fully(&args.references)?;
+    if references.is_empty() {
+        return Err(anyhow!("No reference sequences found in {}", args.references.display()));
+    }
     info!("Loaded {} reference sequences", references.len());
 
-    // Build owned k-mer sets for each reference (used by the prep threads' pre-filter)
-    let ref_kmer_sets_owned: Vec<HashSet<Vec<u8>>> = if kmer_filter_enabled {
-        references.iter().map(|r| collect_kmers_owned(&r.seq, args.kmer_length)).collect()
+    // The GPU workspace is sized from --max-ref-length; a longer reference can
+    // never be aligned, so refuse it up front rather than silently failing.
+    if let Some(longest) = references.iter().max_by_key(|r| r.seq.len()) {
+        if longest.seq.len() > args.max_ref_length {
+            return Err(anyhow!(
+                "Reference '{}' is {} bp, longer than --max-ref-length {}. Raise --max-ref-length.",
+                longest.id, longest.seq.len(), args.max_ref_length));
+        }
+    }
+
+    // Build packed k-mer sets for each reference (used by the prep threads' pre-filter)
+    let ref_kmer_sets_owned: Vec<HashSet<u64>> = if kmer_filter_enabled {
+        references.iter().map(|r| collect_kmers_packed(&r.seq, args.kmer_length)).collect()
     } else {
         Vec::new()
     };
@@ -203,6 +260,9 @@ fn main() -> Result<()> {
         let mut header_fields: Vec<&str> = vec!["read_name", "reference_name", "cigar", "strand"];
         for tag in &header_tags {
             header_fields.push(tag.as_str());
+        }
+        if collapse {
+            header_fields.push("n_reads");
         }
         writer.write_record(&header_fields)?;
     }
@@ -230,10 +290,11 @@ fn main() -> Result<()> {
     let batch_size = args.batch_size;
     let kmer_length = args.kmer_length;
     let kmer_threshold = args.kmer_threshold;
+    let max_read_length = args.max_read_length;
 
     // Decide how many CPU threads to devote to each CPU-bound stage. Preparation
-    // (k-mer filter, reverse-complement, packing) is the heavy stage that tends
-    // to starve the GPUs, so it gets most of the cores; post-processing is
+    // (dedup, k-mer filter, reverse-complement, packing) is the heavy stage that
+    // tends to starve the GPUs, so it gets most of the cores; post-processing is
     // usually light (only pairs over the score budget hit the CPU aligner).
     let hw_par = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let prep_threads = if args.prep_threads > 0 {
@@ -251,9 +312,9 @@ fn main() -> Result<()> {
     // Pipeline: reader -> prep pool -> GPU workers -> post pool -> writer
     //
     //   reader (1)      : reads raw batches from disk
-    //   prep pool (P)   : reverse-complement, pack, k-mer pre-filter
+    //   prep pool (P)   : dedup, reverse-complement, pack, k-mer pre-filter
     //   GPU workers (N) : upload -> WFA kernel -> download  (GPU work only)
-    //   post pool (Q)   : CPU fallback + output row formatting
+    //   post pool (Q)   : CPU fallback + output row formatting (fan-out to reads)
     //   writer (1)      : serializes rows to the output TSV
     //
     // Each stage is decoupled by a bounded channel so a GPU never has to read
@@ -333,6 +394,8 @@ fn main() -> Result<()> {
                     kmer_filter_enabled,
                     kmer_length,
                     kmer_threshold,
+                    dedup,
+                    max_read_length,
                 );
                 stats.busy += t1.elapsed();
                 stats.batches += 1;
@@ -393,6 +456,13 @@ fn main() -> Result<()> {
                   device_id, free_mem as f64 / 1048576.0, total_mem as f64 / 1048576.0,
                   total_bytes_per_pair as f64 / 1024.0, max_gpu_pairs);
 
+            // One wavefront workspace per worker, sized for the largest
+            // sub-batch. The kernel initialises rows lazily, so the buffer is
+            // allocated once and reused across sub-batches without clearing.
+            let mut d_workspace: CudaSlice<i32> = stream
+                .alloc_zeros(max_gpu_pairs * ws_per_pair)
+                .context("Failed to allocate GPU workspace")?;
+
             let mut stats = WorkerStats::default();
 
             loop {
@@ -412,15 +482,18 @@ fn main() -> Result<()> {
 
                 stats.batches += 1;
                 stats.reads += prepared.num_reads;
+                stats.unique += prepared.num_unique;
                 let num_gpu_pairs = prepared.pair_query_idx.len();
 
-                info!("Device {}: aligning batch of {} reads, {} GPU pairs ({} both-filtered)",
-                      device_id, prepared.num_reads, num_gpu_pairs, prepared.kmer_fail_count);
+                info!("Device {}: aligning batch of {} reads ({} unique, {:.1}x), {} GPU pairs ({} both-filtered)",
+                      device_id, prepared.num_reads, prepared.num_unique,
+                      dedup_ratio(prepared.num_reads, prepared.num_unique),
+                      num_gpu_pairs, prepared.kmer_fail_count);
 
                 // GPU work only: upload, launch, synchronize, download.
                 let t1 = Instant::now();
                 let (scores, cigar_ops, cigar_lengths) = run_gpu_alignment(
-                    &stream, &kernel, &prepared,
+                    &stream, &kernel, &prepared, &mut d_workspace,
                     &d_refs, &d_ref_lengths, &d_ref_offsets,
                     gap_open, gap_extend, mismatch,
                     max_k, num_diags, max_score, max_cigar_len, max_gpu_pairs,
@@ -452,9 +525,9 @@ fn main() -> Result<()> {
         let rows_tx = rows_tx.clone();
         let references_arc = Arc::clone(&references_arc);
         let header_tags = header_tags.clone();
-        let handle = thread::spawn(move || -> Result<(StageStats, usize)> {
+        let handle = thread::spawn(move || -> Result<(StageStats, PostTotals)> {
             let mut stats = StageStats::default();
-            let mut cpu_fallbacks = 0usize;
+            let mut totals = PostTotals::default();
             loop {
                 let t0 = Instant::now();
                 let result = {
@@ -468,24 +541,24 @@ fn main() -> Result<()> {
                 };
 
                 let t1 = Instant::now();
-                let (rows, fb) = format_batch_rows(
+                let outcome = format_batch_rows(
                     &result,
                     references_arc.as_slice(),
                     &header_tags,
-                    gap_open, gap_extend, mismatch,
-                    max_score, skip_fail,
+                    gap_open, gap_extend, mismatch, max_k,
+                    skip_fail, collapse,
                 );
                 stats.busy += t1.elapsed();
                 stats.batches += 1;
-                cpu_fallbacks += fb;
+                totals.absorb(&outcome);
 
                 let t2 = Instant::now();
-                if rows_tx.send(rows).is_err() {
+                if rows_tx.send(outcome.rows).is_err() {
                     break; // writer exited
                 }
                 stats.send_wait += t2.elapsed();
             }
-            Ok((stats, cpu_fallbacks))
+            Ok((stats, totals))
         });
         post_handles.push(handle);
     }
@@ -533,6 +606,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("GPU worker for device {} failed", device_ids[i]))?;
         gpu.batches += stats.batches;
         gpu.reads += stats.reads;
+        gpu.unique += stats.unique;
         gpu.gpu_busy += stats.gpu_busy;
         gpu.recv_wait += stats.recv_wait;
         gpu.send_wait += stats.send_wait;
@@ -547,13 +621,13 @@ fn main() -> Result<()> {
     }
 
     let mut post = StageStats::default();
-    let mut total_cpu_fallbacks = 0usize;
+    let mut post_totals = PostTotals::default();
     for (i, handle) in post_handles.into_iter().enumerate() {
-        let (s, fb) = handle.join()
+        let (s, t) = handle.join()
             .map_err(|e| anyhow!("post thread {} panicked: {:?}", i, e))?
             .context("post thread failed")?;
         post.merge(&s);
-        total_cpu_fallbacks += fb;
+        post_totals.merge(&t);
     }
 
     let reader_stats = reader_handle.join()
@@ -566,11 +640,16 @@ fn main() -> Result<()> {
 
     let wall = pipeline_start.elapsed();
 
-    if total_cpu_fallbacks > 0 {
-        info!("CPU fallback used for {} pairs total", total_cpu_fallbacks);
+    if post_totals.cpu_fallbacks > 0 {
+        info!("CPU fallback used for {} pairs total", post_totals.cpu_fallbacks);
     }
-    info!("Alignment completed. Processed {} reads in {} batches across {} device(s)",
-          gpu.reads, gpu.batches, num_devices);
+    if post_totals.too_long_reads > 0 {
+        warn!("{} reads were longer than --max-read-length {} (longest: {} bp) and were reported with cigar '*'. \
+               Raise --max-read-length to align them.",
+              post_totals.too_long_reads, max_read_length, post_totals.longest_read);
+    }
+    info!("Alignment completed. Processed {} reads ({} unique sequences aligned, {:.2}x deduplication) in {} batches across {} device(s)",
+          gpu.reads, gpu.unique, dedup_ratio(gpu.reads, gpu.unique), gpu.batches, num_devices);
 
     log_pipeline_timing(
         wall, &reader_stats, &prep, &gpu, &post, &writer_stats,
@@ -580,25 +659,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// A batch that has been read from disk and pre-filtered by a prep thread,
-/// ready for GPU alignment.
+/// Reads-per-unique-sequence ratio for log lines (1.0 when nothing was processed).
+fn dedup_ratio(reads: usize, unique: usize) -> f64 {
+    if unique == 0 { 1.0 } else { reads as f64 / unique as f64 }
+}
+
+/// A batch that has been read from disk, deduplicated and pre-filtered by a
+/// prep thread, ready for GPU alignment.
+///
+/// Alignment work is organised around *unique sequences*: every read maps to
+/// one unique sequence via `read_to_uidx`, and all per-pair arrays below are
+/// indexed by `ui * num_refs + ri` where `ui` is a unique-sequence index.
 struct PreparedBatch {
+    /// The reads of this batch in input order (names, descriptions, sequences).
     batch: Vec<SequenceRecord>,
+    /// For each unique sequence, the index into `batch` of its first read.
+    unique_rep: Vec<usize>,
+    /// For each read, the index of its unique sequence.
+    read_to_uidx: Vec<usize>,
+    /// Per unique sequence: longer than --max-read-length, so never aligned.
+    too_long: Vec<bool>,
+    /// Packed unique sequences (forward) for GPU upload.
     query_data: Vec<i8>,
     query_lengths: Vec<i32>,
     query_offsets: Vec<i32>,
+    /// Packed unique sequences (reverse complement) for GPU upload.
     rc_query_data: Vec<i8>,
     rc_query_lengths: Vec<i32>,
     rc_query_offsets: Vec<i32>,
+    /// Per (unique, ref) pair: whether that orientation is aligned on the GPU.
     fwd_kmer_pass: Vec<bool>,
     rc_kmer_pass: Vec<bool>,
+    /// Number of (unique, ref) pairs rejected by the k-mer filter in both orientations.
     kmer_fail_count: usize,
+    /// GPU pair list: unique-sequence index, reference index, orientation.
     pair_query_idx: Vec<i32>,
     pair_ref_idx: Vec<i32>,
     pair_is_rc: Vec<bool>,
+    /// Per (unique, ref) pair: position in the GPU pair list for each orientation.
     fwd_gpu_idx: Vec<Option<usize>>,
     rc_gpu_idx: Vec<Option<usize>>,
     num_reads: usize,
+    num_unique: usize,
     num_refs: usize,
 }
 
@@ -620,6 +722,7 @@ struct GpuBatchResult {
 struct WorkerStats {
     batches: u64,
     reads: usize,
+    unique: usize,
     gpu_busy: Duration,
     recv_wait: Duration,
     send_wait: Duration,
@@ -644,6 +747,49 @@ impl StageStats {
         self.send_wait += other.send_wait;
         self.batches += other.batches;
     }
+}
+
+/// Counters produced by the post-processing stage for the end-of-run summary.
+#[derive(Default, Clone)]
+struct PostTotals {
+    cpu_fallbacks: usize,
+    too_long_reads: usize,
+    longest_read: usize,
+}
+
+impl PostTotals {
+    fn absorb(&mut self, outcome: &PostBatchOutcome) {
+        self.cpu_fallbacks += outcome.cpu_fallbacks;
+        self.too_long_reads += outcome.too_long_reads;
+        self.longest_read = self.longest_read.max(outcome.longest_read);
+    }
+
+    fn merge(&mut self, other: &PostTotals) {
+        self.cpu_fallbacks += other.cpu_fallbacks;
+        self.too_long_reads += other.too_long_reads;
+        self.longest_read = self.longest_read.max(other.longest_read);
+    }
+}
+
+/// Output rows for one batch plus the counters the summary needs.
+struct PostBatchOutcome {
+    rows: Vec<Vec<String>>,
+    cpu_fallbacks: usize,
+    too_long_reads: usize,
+    longest_read: usize,
+}
+
+/// The resolved outcome of one (unique sequence, reference) pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairCall {
+    /// The k-mer filter rejected both orientations.
+    Failed,
+    /// The read exceeds --max-read-length and was not aligned.
+    TooLong,
+    /// Neither orientation could be aligned (GPU and CPU both gave up).
+    Unaligned,
+    /// Best orientation's alignment.
+    Aligned { cigar: String, strand: &'static str },
 }
 
 /// Results from a GPU kernel launch
@@ -705,75 +851,102 @@ fn log_pipeline_timing(
 // Batch preparation (runs on the prep pool)
 // ============================================================
 
-/// Turn a raw batch of reads into a `PreparedBatch`: generate reverse
-/// complements, pack both orientations for GPU upload, run the k-mer pre-filter,
-/// and build the per-pair index lists. This is the CPU-heavy work that runs in
-/// parallel across the prep pool so it does not starve the GPUs.
+/// Map every read of a batch to a unique-sequence index.
+///
+/// Returns `(unique_rep, read_to_uidx)`: `unique_rep[ui]` is the index of the
+/// first read carrying unique sequence `ui` (so unique sequences are numbered in
+/// first-seen order), and `read_to_uidx[qi]` is the unique index of read `qi`.
+/// With `dedup == false` both are the identity mapping.
+fn dedup_reads(batch: &[SequenceRecord], dedup: bool) -> (Vec<usize>, Vec<usize>) {
+    let n = batch.len();
+    if !dedup {
+        return ((0..n).collect(), (0..n).collect());
+    }
+    let mut seq_index: HashMap<&[u8], usize> = HashMap::with_capacity(n);
+    let mut unique_rep: Vec<usize> = Vec::new();
+    let mut read_to_uidx: Vec<usize> = Vec::with_capacity(n);
+    for (qi, rec) in batch.iter().enumerate() {
+        let ui = *seq_index.entry(rec.seq.as_slice()).or_insert_with(|| {
+            unique_rep.push(qi);
+            unique_rep.len() - 1
+        });
+        read_to_uidx.push(ui);
+    }
+    (unique_rep, read_to_uidx)
+}
+
+/// Turn a raw batch of reads into a `PreparedBatch`: deduplicate the sequences,
+/// generate reverse complements, pack both orientations for GPU upload, run the
+/// k-mer pre-filter, and build the per-pair index lists. This is the CPU-heavy
+/// work that runs in parallel across the prep pool so it does not starve the
+/// GPUs.
 fn prepare_batch(
     batch: Vec<SequenceRecord>,
     references: &[SequenceRecord],
-    ref_kmer_sets: &[HashSet<Vec<u8>>],
+    ref_kmer_sets: &[HashSet<u64>],
     kmer_filter_enabled: bool,
     kmer_length: usize,
     kmer_threshold: f64,
+    dedup: bool,
+    max_read_length: usize,
 ) -> PreparedBatch {
     let num_reads = batch.len();
     let num_refs = references.len();
-    let num_pairs = num_reads * num_refs;
 
-    // Generate reverse complement sequences for each read
-    let rc_seqs: Vec<Vec<u8>> = batch.iter()
-        .map(|rec| reverse_complement(&rec.seq))
-        .collect();
+    // Deduplicate: every read maps to a unique sequence; all alignment work
+    // below is per unique sequence.
+    let (unique_rep, read_to_uidx) = dedup_reads(&batch, dedup);
+    let num_unique = unique_rep.len();
+    let num_pairs = num_unique * num_refs;
 
-    // Pack forward and reverse-complement query sequences for GPU upload,
+    let unique_seqs: Vec<&[u8]> = unique_rep.iter().map(|&qi| batch[qi].seq.as_slice()).collect();
+    let too_long: Vec<bool> = unique_seqs.iter().map(|s| s.len() > max_read_length).collect();
+
+    // Generate reverse complement sequences for each unique sequence
+    let rc_seqs: Vec<Vec<u8>> = unique_seqs.iter().map(|s| reverse_complement(s)).collect();
+    let rc_slices: Vec<&[u8]> = rc_seqs.iter().map(|s| s.as_slice()).collect();
+
+    // Pack forward and reverse-complement unique sequences for GPU upload,
     // converting lengths/offsets to i32 here so the GPU worker uploads directly.
-    let (query_data, query_lengths_us, query_offsets_us) = pack_sequences(&batch);
-    let (rc_query_data, rc_query_lengths_us, rc_query_offsets_us) = pack_sequences_raw(&rc_seqs);
+    let (query_data, query_lengths_us, query_offsets_us) = pack_sequences_raw(&unique_seqs);
+    let (rc_query_data, rc_query_lengths_us, rc_query_offsets_us) = pack_sequences_raw(&rc_slices);
     let query_lengths: Vec<i32> = query_lengths_us.iter().map(|&x| x as i32).collect();
     let query_offsets: Vec<i32> = query_offsets_us.iter().map(|&x| x as i32).collect();
     let rc_query_lengths: Vec<i32> = rc_query_lengths_us.iter().map(|&x| x as i32).collect();
     let rc_query_offsets: Vec<i32> = rc_query_offsets_us.iter().map(|&x| x as i32).collect();
 
-    // Run k-mer pre-filter for both orientations
+    // Per-pair orientation eligibility: start from "align both orientations",
+    // then drop over-length sequences and k-mer filter failures.
     let mut fwd_kmer_pass = vec![true; num_pairs];
     let mut rc_kmer_pass = vec![true; num_pairs];
     let mut kmer_fail_count = 0usize;
 
-    if kmer_filter_enabled {
-        for qi in 0..num_reads {
-            let fwd_kmers = collect_kmers_owned(&batch[qi].seq, kmer_length);
-            let rc_kmers = collect_kmers_owned(&rc_seqs[qi], kmer_length);
-
+    for ui in 0..num_unique {
+        if too_long[ui] {
             for ri in 0..num_refs {
-                let global_idx = qi * num_refs + ri;
+                let global_idx = ui * num_refs + ri;
+                fwd_kmer_pass[global_idx] = false;
+                rc_kmer_pass[global_idx] = false;
+            }
+            continue;
+        }
+        if !kmer_filter_enabled {
+            continue;
+        }
+        let fwd_kmers = collect_kmers_packed(unique_seqs[ui], kmer_length);
+        let rc_kmers = collect_kmers_packed(&rc_seqs[ui], kmer_length);
 
-                // Check forward orientation
-                if !fwd_kmers.is_empty() {
-                    let hits = fwd_kmers.iter()
-                        .filter(|km| ref_kmer_sets[ri].contains(km.as_slice()))
-                        .count();
-                    let fraction = hits as f64 / fwd_kmers.len() as f64;
-                    if fraction < kmer_threshold {
-                        fwd_kmer_pass[global_idx] = false;
-                    }
-                }
-
-                // Check reverse complement orientation
-                if !rc_kmers.is_empty() {
-                    let hits = rc_kmers.iter()
-                        .filter(|km| ref_kmer_sets[ri].contains(km.as_slice()))
-                        .count();
-                    let fraction = hits as f64 / rc_kmers.len() as f64;
-                    if fraction < kmer_threshold {
-                        rc_kmer_pass[global_idx] = false;
-                    }
-                }
-
-                // Count pairs where BOTH orientations fail
-                if !fwd_kmer_pass[global_idx] && !rc_kmer_pass[global_idx] {
-                    kmer_fail_count += 1;
-                }
+        for ri in 0..num_refs {
+            let global_idx = ui * num_refs + ri;
+            if !kmer_fraction_passes(&fwd_kmers, &ref_kmer_sets[ri], kmer_threshold) {
+                fwd_kmer_pass[global_idx] = false;
+            }
+            if !kmer_fraction_passes(&rc_kmers, &ref_kmer_sets[ri], kmer_threshold) {
+                rc_kmer_pass[global_idx] = false;
+            }
+            // Count pairs where BOTH orientations fail
+            if !fwd_kmer_pass[global_idx] && !rc_kmer_pass[global_idx] {
+                kmer_fail_count += 1;
             }
         }
     }
@@ -785,12 +958,12 @@ fn prepare_batch(
 
     // Forward pairs
     let mut fwd_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
-    for qi in 0..num_reads {
+    for ui in 0..num_unique {
         for ri in 0..num_refs {
-            let global_idx = qi * num_refs + ri;
+            let global_idx = ui * num_refs + ri;
             if fwd_kmer_pass[global_idx] {
                 fwd_gpu_idx[global_idx] = Some(pair_query_idx.len());
-                pair_query_idx.push(qi as i32);
+                pair_query_idx.push(ui as i32);
                 pair_ref_idx.push(ri as i32);
                 pair_is_rc.push(false);
             }
@@ -799,12 +972,12 @@ fn prepare_batch(
 
     // RC pairs
     let mut rc_gpu_idx: Vec<Option<usize>> = vec![None; num_pairs];
-    for qi in 0..num_reads {
+    for ui in 0..num_unique {
         for ri in 0..num_refs {
-            let global_idx = qi * num_refs + ri;
+            let global_idx = ui * num_refs + ri;
             if rc_kmer_pass[global_idx] {
                 rc_gpu_idx[global_idx] = Some(pair_query_idx.len());
-                pair_query_idx.push(qi as i32);
+                pair_query_idx.push(ui as i32);
                 pair_ref_idx.push(ri as i32);
                 pair_is_rc.push(true);
             }
@@ -813,6 +986,9 @@ fn prepare_batch(
 
     PreparedBatch {
         batch,
+        unique_rep,
+        read_to_uidx,
+        too_long,
         query_data,
         query_lengths,
         query_offsets,
@@ -828,6 +1004,7 @@ fn prepare_batch(
         fwd_gpu_idx,
         rc_gpu_idx,
         num_reads,
+        num_unique,
         num_refs,
     }
 }
@@ -842,12 +1019,14 @@ fn prepare_batch(
 /// kernel launch, synchronize, download); output formatting and CPU fallback are
 /// done later on a post-processing thread.
 ///
-/// This is invoked from each GPU worker thread; `stream`, `kernel`, and the
-/// `d_ref*` slices all belong to that worker's device context.
+/// This is invoked from each GPU worker thread; `stream`, `kernel`,
+/// `d_workspace` and the `d_ref*` slices all belong to that worker's device
+/// context.
 fn run_gpu_alignment(
     stream: &Arc<cudarc::driver::CudaStream>,
     kernel: &cudarc::driver::CudaFunction,
     prepared: &PreparedBatch,
+    d_workspace: &mut CudaSlice<i32>,
     d_refs: &CudaSlice<i8>,
     d_ref_lengths: &CudaSlice<i32>,
     d_ref_offsets: &CudaSlice<i32>,
@@ -898,7 +1077,7 @@ fn run_gpu_alignment(
             .collect();
 
         let results = launch_alignment_kernel(
-            stream, kernel,
+            stream, kernel, d_workspace,
             &d_fwd_queries, &d_fwd_query_lengths, &d_fwd_query_offsets,
             d_refs, d_ref_lengths, d_ref_offsets,
             &fwd_query_idx, &fwd_ref_idx,
@@ -923,7 +1102,7 @@ fn run_gpu_alignment(
             .collect();
 
         let results = launch_alignment_kernel(
-            stream, kernel,
+            stream, kernel, d_workspace,
             &d_rc_queries, &d_rc_query_lengths, &d_rc_query_offsets,
             d_refs, d_ref_lengths, d_ref_offsets,
             &rc_query_idx, &rc_ref_idx,
@@ -945,11 +1124,103 @@ fn run_gpu_alignment(
 // Output formatting + CPU fallback (runs on the post pool)
 // ============================================================
 
-/// Build the TSV output rows for one batch from its GPU results. For each
-/// read×reference pair, pick the best orientation; pairs the GPU could not
-/// resolve within the score budget are transparently re-aligned on the CPU here.
-/// Returns the rows (one per pair, unless filtered/skipped) and the number of
-/// CPU fallbacks performed. Runs on a post-processing thread, off the GPU path.
+/// Resolve one orientation of a (unique sequence, reference) pair: take the GPU
+/// result if the pair was aligned within the score budget, otherwise re-align on
+/// the CPU. `query` is only invoked when the CPU fallback is needed (so the
+/// reverse complement is not recomputed for pairs the GPU finished).
+/// Returns `(score, cigar)` or `None` if the orientation was filtered out or
+/// could not be aligned at all.
+fn resolve_orientation<'a, F>(
+    passed: bool,
+    gpu_idx: Option<usize>,
+    result: &GpuBatchResult,
+    query: F,
+    reference: &[u8],
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+    max_k: usize,
+    cpu_fallbacks: &mut usize,
+    label: &str,
+    read_id: &str,
+    ref_id: &str,
+) -> Option<(i32, String)>
+where
+    F: FnOnce() -> Cow<'a, [u8]>,
+{
+    if !passed {
+        return None;
+    }
+    let gpu_idx = gpu_idx.expect("pair that passed the filter must have a GPU index");
+    let score = result.scores[gpu_idx];
+    let cigar_len = result.cigar_lengths[gpu_idx] as usize;
+    if score >= 0 && cigar_len > 0 {
+        let ops: Vec<u8> = result.cigar_ops[gpu_idx].iter().map(|&x| x as u8).collect();
+        return Some((score, ops_to_cigar(&ops)));
+    }
+    *cpu_fallbacks += 1;
+    debug!("CPU fallback ({}) for read {} vs ref {}", label, read_id, ref_id);
+    let q = query();
+    cpu_align(&q, reference, gap_open, gap_extend, mismatch, max_k)
+}
+
+/// Append one output row for a resolved pair. `n_reads` is `Some` only in
+/// collapsed mode and is always the last column, so positional parsers of the
+/// leading columns keep working in both modes.
+fn push_row(
+    rows: &mut Vec<Vec<String>>,
+    call: &PairCall,
+    read_id: &str,
+    ref_id: &str,
+    tag_values: &[String],
+    n_reads: Option<usize>,
+    skip_fail: bool,
+) {
+    let (cigar, strand): (&str, &str) = match call {
+        PairCall::Failed => {
+            if skip_fail {
+                return;
+            }
+            ("FAILED", ".")
+        }
+        PairCall::TooLong | PairCall::Unaligned => ("*", "."),
+        PairCall::Aligned { cigar, strand } => (cigar.as_str(), strand),
+    };
+    let mut row = Vec::with_capacity(5 + tag_values.len());
+    row.push(read_id.to_string());
+    row.push(ref_id.to_string());
+    row.push(cigar.to_string());
+    row.push(strand.to_string());
+    row.extend(tag_values.iter().cloned());
+    if let Some(n) = n_reads {
+        row.push(n.to_string());
+    }
+    rows.push(row);
+}
+
+/// A set of reads in one batch that share a unique sequence and header-tag
+/// values (collapsed output mode).
+struct ReadGroup {
+    first_read: usize,
+    uidx: usize,
+    tag_values: Vec<String>,
+    n_reads: usize,
+}
+
+/// Build the TSV output rows for one batch from its GPU results.
+///
+/// Step 1 resolves every (unique sequence, reference) pair once: pick the best
+/// orientation, transparently re-aligning on the CPU any orientation the GPU
+/// could not finish within the score budget. Step 2 fans the resolved calls out
+/// to the reads: one row per read x reference in input order (rows for a read
+/// stay contiguous), or, with `collapse`, one row per (sequence, tag values)
+/// group x reference with a trailing `n_reads` column.
+///
+/// `max_k` is the kernel's diagonal half-range (`max(max_read_length,
+/// max_ref_length)`), passed to the CPU fallback so it explores exactly the
+/// same wavefront as the GPU would.
+///
+/// Runs on a post-processing thread, off the GPU path.
 fn format_batch_rows(
     result: &GpuBatchResult,
     references: &[SequenceRecord],
@@ -957,149 +1228,133 @@ fn format_batch_rows(
     gap_open: i32,
     gap_extend: i32,
     mismatch: i32,
-    max_score: usize,
+    max_k: usize,
     skip_fail: bool,
-) -> (Vec<Vec<String>>, usize) {
+    collapse: bool,
+) -> PostBatchOutcome {
     let prepared = &result.prepared;
-    let all_scores = &result.scores;
-    let all_cigar_ops = &result.cigar_ops;
-    let all_cigar_lengths = &result.cigar_lengths;
     let num_refs = prepared.num_refs;
+    let mut cpu_fallbacks = 0usize;
 
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut cpu_fallback_count = 0usize;
-    for qi in 0..prepared.num_reads {
-        let tag_values: Vec<String> = if !header_tags.is_empty() {
-            header_tags.iter().map(|tag| {
-                extract_tag_value(prepared.batch[qi].desc.as_deref(), tag)
-            }).collect()
-        } else {
-            Vec::new()
-        };
-
+    // ---- Step 1: resolve each (unique sequence, reference) pair once ----
+    let mut calls: Vec<PairCall> = Vec::with_capacity(prepared.num_unique * num_refs);
+    for ui in 0..prepared.num_unique {
+        let rep = &prepared.batch[prepared.unique_rep[ui]];
+        let seq = rep.seq.as_slice();
         for ri in 0..num_refs {
-            let global_idx = qi * num_refs + ri;
+            let global_idx = ui * num_refs + ri;
+
+            if prepared.too_long[ui] {
+                calls.push(PairCall::TooLong);
+                continue;
+            }
 
             let fwd_passed = prepared.fwd_kmer_pass[global_idx];
             let rc_passed = prepared.rc_kmer_pass[global_idx];
 
             // If neither orientation passed the k-mer filter, report FAILED
-            // (or skip entirely if --skip-fail is set)
             if !fwd_passed && !rc_passed {
-                if !skip_fail {
-                    let mut row = vec![
-                        prepared.batch[qi].id.clone(),
-                        references[ri].id.clone(),
-                        "FAILED".to_string(),
-                        ".".to_string(),
-                    ];
-                    for val in &tag_values {
-                        row.push(val.clone());
-                    }
-                    rows.push(row);
-                }
+                calls.push(PairCall::Failed);
                 continue;
             }
 
-            // Get forward result (if it was aligned)
-            let fwd_result = if fwd_passed {
-                let gpu_idx = prepared.fwd_gpu_idx[global_idx]
-                    .expect("forward-passed pair must have a GPU index");
-                let score = all_scores[gpu_idx];
-                let cigar_len = all_cigar_lengths[gpu_idx] as usize;
-                if score >= 0 && cigar_len > 0 {
-                    let ops: Vec<u8> = all_cigar_ops[gpu_idx]
-                        .iter()
-                        .map(|&x| x as u8)
-                        .collect();
-                    Some((score, ops_to_cigar(&ops)))
-                } else {
-                    cpu_fallback_count += 1;
-                    debug!("CPU fallback (fwd) for read {} vs ref {}", prepared.batch[qi].id, references[ri].id);
-                    let cigar = cpu_align(
-                        &prepared.batch[qi].seq,
-                        &references[ri].seq,
-                        gap_open,
-                        gap_extend,
-                        mismatch,
-                    );
-                    if cigar == "*" {
-                        None
-                    } else {
-                        Some((max_score as i32 + 1, cigar))
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Get RC result (if it was aligned)
-            let rc_result = if rc_passed {
-                let gpu_idx = prepared.rc_gpu_idx[global_idx]
-                    .expect("rc-passed pair must have a GPU index");
-                let score = all_scores[gpu_idx];
-                let cigar_len = all_cigar_lengths[gpu_idx] as usize;
-                if score >= 0 && cigar_len > 0 {
-                    let ops: Vec<u8> = all_cigar_ops[gpu_idx]
-                        .iter()
-                        .map(|&x| x as u8)
-                        .collect();
-                    Some((score, ops_to_cigar(&ops)))
-                } else {
-                    cpu_fallback_count += 1;
-                    debug!("CPU fallback (rc) for read {} vs ref {}", prepared.batch[qi].id, references[ri].id);
-                    let rc_seq = reverse_complement(&prepared.batch[qi].seq);
-                    let cigar = cpu_align(
-                        &rc_seq,
-                        &references[ri].seq,
-                        gap_open,
-                        gap_extend,
-                        mismatch,
-                    );
-                    if cigar == "*" {
-                        None
-                    } else {
-                        Some((max_score as i32 + 1, cigar))
-                    }
-                }
-            } else {
-                None
-            };
+            let fwd_result = resolve_orientation(
+                fwd_passed, prepared.fwd_gpu_idx[global_idx], result,
+                || Cow::Borrowed(seq), &references[ri].seq,
+                gap_open, gap_extend, mismatch, max_k, &mut cpu_fallbacks,
+                "fwd", &rep.id, &references[ri].id,
+            );
+            let rc_result = resolve_orientation(
+                rc_passed, prepared.rc_gpu_idx[global_idx], result,
+                || Cow::Owned(reverse_complement(seq)), &references[ri].seq,
+                gap_open, gap_extend, mismatch, max_k, &mut cpu_fallbacks,
+                "rc", &rep.id, &references[ri].id,
+            );
 
             // Pick the best orientation (lower score = better alignment)
-            let (cigar, strand) = match (fwd_result, rc_result) {
-                (None, None) => ("*".to_string(), "."),
-                (Some((_score, cigar)), None) => (cigar, "+"),
-                (None, Some((_score, cigar))) => (cigar, "-"),
+            calls.push(match (fwd_result, rc_result) {
+                (None, None) => PairCall::Unaligned,
+                (Some((_, cigar)), None) => PairCall::Aligned { cigar, strand: "+" },
+                (None, Some((_, cigar))) => PairCall::Aligned { cigar, strand: "-" },
                 (Some((fwd_score, fwd_cigar)), Some((rc_score, rc_cigar))) => {
                     if fwd_score <= rc_score {
-                        (fwd_cigar, "+")
+                        PairCall::Aligned { cigar: fwd_cigar, strand: "+" }
                     } else {
-                        (rc_cigar, "-")
+                        PairCall::Aligned { cigar: rc_cigar, strand: "-" }
                     }
                 }
-            };
-
-            let mut row = vec![
-                prepared.batch[qi].id.clone(),
-                references[ri].id.clone(),
-                cigar,
-                strand.to_string(),
-            ];
-            for val in &tag_values {
-                row.push(val.clone());
-            }
-            rows.push(row);
+            });
         }
     }
 
-    (rows, cpu_fallback_count)
+    // ---- Step 2: fan out to reads ----
+    let tag_values_for = |qi: usize| -> Vec<String> {
+        header_tags.iter()
+            .map(|tag| extract_tag_value(prepared.batch[qi].desc.as_deref(), tag))
+            .collect()
+    };
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut too_long_reads = 0usize;
+    let mut longest_read = 0usize;
+
+    if !collapse {
+        for qi in 0..prepared.num_reads {
+            let ui = prepared.read_to_uidx[qi];
+            if prepared.too_long[ui] {
+                too_long_reads += 1;
+                longest_read = longest_read.max(prepared.batch[qi].seq.len());
+            }
+            let tag_values = tag_values_for(qi);
+            for ri in 0..num_refs {
+                push_row(
+                    &mut rows, &calls[ui * num_refs + ri],
+                    &prepared.batch[qi].id, &references[ri].id,
+                    &tag_values, None, skip_fail,
+                );
+            }
+        }
+    } else {
+        // Group reads by (unique sequence, tag values), first-seen order.
+        let mut group_of: HashMap<(usize, Vec<String>), usize> = HashMap::new();
+        let mut groups: Vec<ReadGroup> = Vec::new();
+        for qi in 0..prepared.num_reads {
+            let ui = prepared.read_to_uidx[qi];
+            if prepared.too_long[ui] {
+                too_long_reads += 1;
+                longest_read = longest_read.max(prepared.batch[qi].seq.len());
+            }
+            let tag_values = tag_values_for(qi);
+            match group_of.entry((ui, tag_values)) {
+                Entry::Occupied(e) => groups[*e.get()].n_reads += 1,
+                Entry::Vacant(e) => {
+                    let tag_values = e.key().1.clone();
+                    e.insert(groups.len());
+                    groups.push(ReadGroup { first_read: qi, uidx: ui, tag_values, n_reads: 1 });
+                }
+            }
+        }
+        for g in &groups {
+            for ri in 0..num_refs {
+                push_row(
+                    &mut rows, &calls[g.uidx * num_refs + ri],
+                    &prepared.batch[g.first_read].id, &references[ri].id,
+                    &g.tag_values, Some(g.n_reads), skip_fail,
+                );
+            }
+        }
+    }
+
+    PostBatchOutcome { rows, cpu_fallbacks, too_long_reads, longest_read }
 }
 
-/// Launch the WFA alignment kernel for a set of pairs, handling sub-batching for GPU memory.
+/// Launch the WFA alignment kernel for a set of pairs, handling sub-batching for
+/// GPU memory. `d_workspace` is the worker's persistent wavefront workspace; it
+/// must hold at least `max_gpu_pairs` pairs' worth of ints.
 fn launch_alignment_kernel(
     stream: &Arc<cudarc::driver::CudaStream>,
     kernel: &cudarc::driver::CudaFunction,
+    d_workspace: &mut CudaSlice<i32>,
     d_queries: &CudaSlice<i8>,
     d_query_lengths: &CudaSlice<i32>,
     d_query_offsets: &CudaSlice<i32>,
@@ -1136,10 +1391,12 @@ fn launch_alignment_kernel(
         let d_pair_ref_idx = stream.memcpy_stod(sub_pair_ref_idx)?;
 
         let total_ws = sub_batch_size * ws_per_pair;
+        ensure!(total_ws <= d_workspace.len(),
+                "GPU workspace too small: {} ints needed for {} pairs, {} allocated",
+                total_ws, sub_batch_size, d_workspace.len());
         let ws_mb = (total_ws * 4) / (1024 * 1024);
         debug!("GPU sub-batch {}: {} pairs, workspace {} MB", sub_batch_idx, sub_batch_size, ws_mb);
 
-        let mut d_workspace: CudaSlice<i32> = stream.alloc_zeros(total_ws)?;
         let mut d_out_scores: CudaSlice<i32> = stream.alloc_zeros(sub_batch_size)?;
         let total_cigar_bytes = sub_batch_size * max_cigar_len;
         let mut d_out_cigars: CudaSlice<i8> = stream.alloc_zeros(total_cigar_bytes)?;
@@ -1179,7 +1436,7 @@ fn launch_alignment_kernel(
             .arg(&arg_max_k)
             .arg(&arg_num_diags)
             .arg(&arg_max_score)
-            .arg(&mut d_workspace)
+            .arg(&mut *d_workspace)
             .arg(&mut d_out_scores)
             .arg(&mut d_out_cigars)
             .arg(&mut d_out_cigar_lengths)
@@ -1221,7 +1478,8 @@ fn launch_alignment_kernel(
 // Reverse complement
 // ============================================================
 
-/// Compute the reverse complement of a DNA sequence.
+/// Compute the reverse complement of a DNA sequence. Sequences are uppercased
+/// on load, but lowercase is tolerated here for callers that bypass the reader.
 fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&b| match b {
         b'A' | b'a' => b'T',
@@ -1273,211 +1531,297 @@ fn op_to_char(op: u8) -> char {
 // CPU fallback WFA alignment
 // ============================================================
 
-fn cpu_align(query: &[u8], reference: &[u8], gap_open: i32, gap_extend: i32, mismatch: i32) -> String {
-    use std::collections::HashMap;
+// Backtrack source component (matches the kernel's COMP_* defines)
+const COMP_M: u8 = 0;
+const COMP_I: u8 = 1;
+const COMP_D: u8 = 2;
 
-    let n = query.len() as i32;
-    let m = reference.len() as i32;
-    let target_k = n - m;
+/// Marker for a backtrack cell that was never written.
+const BT_NONE: u8 = u8::MAX;
 
-    let mut wf_m: HashMap<(i32, i32), i32> = HashMap::new();
-    let mut wf_i: HashMap<(i32, i32), i32> = HashMap::new();
-    let mut wf_d: HashMap<(i32, i32), i32> = HashMap::new();
-    let mut bt: HashMap<(i32, i32), (i32, i32, u8, u8)> = HashMap::new();
+/// Backtrack record for one (score, diagonal) cell of the M wavefront.
+#[derive(Clone, Copy)]
+struct BtEntry {
+    prev_s: i32,
+    prev_k: i32,
+    op: u8,
+    src: u8,
+}
 
-    wf_m.insert((0, 0), 0);
+const BT_UNSET: BtEntry = BtEntry { prev_s: 0, prev_k: 0, op: BT_NONE, src: 0 };
 
-    // Extend score 0
-    if let Some(off) = wf_m.get_mut(&(0, 0)) {
-        while *off < m && (*off) < n {
-            if query[(*off) as usize] == reference[(*off) as usize] {
-                *off += 1;
-            } else {
-                break;
-            }
+/// Flat, lazily grown wavefront storage for the CPU aligner. Row `s` of each
+/// component holds `num_diags` cells indexed by `ki = k + max_k`, mirroring
+/// the kernel's layout so both aligners produce identical CIGARs.
+struct CpuWavefronts {
+    num_diags: usize,
+    max_k: i32,
+    m: Vec<i32>,
+    i: Vec<i32>,
+    d: Vec<i32>,
+    bt: Vec<BtEntry>,
+}
+
+impl CpuWavefronts {
+    fn new(max_k: i32) -> Self {
+        CpuWavefronts {
+            num_diags: (2 * max_k + 1) as usize,
+            max_k,
+            m: Vec::new(),
+            i: Vec::new(),
+            d: Vec::new(),
+            bt: Vec::new(),
         }
     }
 
-    if wf_m.get(&(0, target_k)).copied().unwrap_or(-1) >= m {
-        return format!("{}=", n);
+    /// Make sure rows `0..=s` exist (new rows start EMPTY / unset).
+    fn ensure_row(&mut self, s: i32) {
+        let need = (s as usize + 1) * self.num_diags;
+        if self.m.len() < need {
+            self.m.resize(need, WF_EMPTY);
+            self.i.resize(need, WF_EMPTY);
+            self.d.resize(need, WF_EMPTY);
+            self.bt.resize(need, BT_UNSET);
+        }
+    }
+
+    #[inline]
+    fn idx(&self, s: i32, ki: i32) -> usize {
+        s as usize * self.num_diags + ki as usize
+    }
+
+    /// Inclusive `ki` range of diagonals that can be populated at score `s`:
+    /// every k-changing transition costs at least `gap_extend`.
+    fn band(&self, s: i32, gap_extend: i32) -> (i32, i32) {
+        let half = if gap_extend <= 0 { self.max_k } else { (s / gap_extend).min(self.max_k) };
+        (self.max_k - half, self.max_k + half)
+    }
+}
+
+/// Gap-affine WFA alignment on the CPU, used for pairs whose score exceeds the
+/// GPU budget. A direct port of the kernel (same wavefront layout, same
+/// backtrack rules), with lazily allocated rows and banded loops.
+/// `workspace_max_k` is the kernel's `max_k` (`max(max_read_length,
+/// max_ref_length)`); using the same diagonal range makes the CPU result
+/// identical to what the GPU would compute. Pass 0 to size from the pair alone.
+/// Returns `(score, cigar)`, or `None` if no alignment is found within
+/// `CPU_MAX_SCORE`.
+fn cpu_align(
+    query: &[u8],
+    reference: &[u8],
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+    workspace_max_k: usize,
+) -> Option<(i32, String)> {
+    let n = query.len() as i32;
+    let m = reference.len() as i32;
+    let max_k = std::cmp::max(std::cmp::max(n, m), std::cmp::max(workspace_max_k as i32, 1));
+    let target_k = n - m;
+
+    let mut wf = CpuWavefronts::new(max_k);
+    let nd = wf.num_diags as i32;
+
+    // Greedy match extension along diagonal k from reference offset `off`.
+    let extend = |mut off: i32, k: i32| -> i32 {
+        while off < m && off + k >= 0 && off + k < n
+            && query[(off + k) as usize] == reference[off as usize]
+        {
+            off += 1;
+        }
+        off
+    };
+
+    // Score 0
+    wf.ensure_row(0);
+    let j0 = wf.idx(0, max_k);
+    wf.m[j0] = extend(0, 0);
+    if target_k == 0 && wf.m[j0] >= m {
+        return Some((0, format!("{}=", n)));
     }
 
     let mut final_score = -1i32;
 
-    for s in 1..=4096i32 {
-        // Insertions
+    for s in 1..=CPU_MAX_SCORE {
+        wf.ensure_row(s);
+        let (lo_s, hi_s) = wf.band(s, gap_extend);
+
+        // --- Insertions (gap in reference, query advances): k + 1, offset stays ---
         let ins_s = s - gap_open - gap_extend;
         if ins_s >= 0 {
-            let entries: Vec<_> = wf_m.iter()
-                .filter(|&(&(sc, _), _)| sc == ins_s)
-                .map(|(&(_, k), &off)| (k, off)).collect();
-            for (k, off) in entries {
-                let nk = k + 1;
-                if off > wf_i.get(&(s, nk)).copied().unwrap_or(-1) {
-                    wf_i.insert((s, nk), off);
+            let (lo, hi) = wf.band(ins_s, gap_extend);
+            for ki in lo..=hi {
+                let prev_off = wf.m[wf.idx(ins_s, ki)];
+                if prev_off == WF_EMPTY { continue; }
+                let new_ki = ki + 1;
+                if new_ki >= 0 && new_ki < nd {
+                    let j = wf.idx(s, new_ki);
+                    if prev_off > wf.i[j] { wf.i[j] = prev_off; }
                 }
             }
         }
         let ins_ext_s = s - gap_extend;
         if ins_ext_s >= 0 {
-            let entries: Vec<_> = wf_i.iter()
-                .filter(|&(&(sc, _), _)| sc == ins_ext_s)
-                .map(|(&(_, k), &off)| (k, off)).collect();
-            for (k, off) in entries {
-                let nk = k + 1;
-                if off > wf_i.get(&(s, nk)).copied().unwrap_or(-1) {
-                    wf_i.insert((s, nk), off);
+            let (lo, hi) = wf.band(ins_ext_s, gap_extend);
+            for ki in lo..=hi {
+                let prev_off = wf.i[wf.idx(ins_ext_s, ki)];
+                if prev_off == WF_EMPTY { continue; }
+                let new_ki = ki + 1;
+                if new_ki >= 0 && new_ki < nd {
+                    let j = wf.idx(s, new_ki);
+                    if prev_off > wf.i[j] { wf.i[j] = prev_off; }
                 }
             }
         }
 
-        // Deletions
+        // --- Deletions (gap in query, reference advances): k - 1, offset + 1 ---
         let del_s = s - gap_open - gap_extend;
         if del_s >= 0 {
-            let entries: Vec<_> = wf_m.iter()
-                .filter(|&(&(sc, _), _)| sc == del_s)
-                .map(|(&(_, k), &off)| (k, off)).collect();
-            for (k, off) in entries {
-                let nk = k - 1;
-                let noff = off + 1;
-                if noff > wf_d.get(&(s, nk)).copied().unwrap_or(-1) {
-                    wf_d.insert((s, nk), noff);
+            let (lo, hi) = wf.band(del_s, gap_extend);
+            for ki in lo..=hi {
+                let prev_off = wf.m[wf.idx(del_s, ki)];
+                if prev_off == WF_EMPTY { continue; }
+                let new_ki = ki - 1;
+                let new_off = prev_off + 1;
+                if new_ki >= 0 && new_ki < nd {
+                    let j = wf.idx(s, new_ki);
+                    if new_off > wf.d[j] { wf.d[j] = new_off; }
                 }
             }
         }
         let del_ext_s = s - gap_extend;
         if del_ext_s >= 0 {
-            let entries: Vec<_> = wf_d.iter()
-                .filter(|&(&(sc, _), _)| sc == del_ext_s)
-                .map(|(&(_, k), &off)| (k, off)).collect();
-            for (k, off) in entries {
-                let nk = k - 1;
-                let noff = off + 1;
-                if noff > wf_d.get(&(s, nk)).copied().unwrap_or(-1) {
-                    wf_d.insert((s, nk), noff);
+            let (lo, hi) = wf.band(del_ext_s, gap_extend);
+            for ki in lo..=hi {
+                let prev_off = wf.d[wf.idx(del_ext_s, ki)];
+                if prev_off == WF_EMPTY { continue; }
+                let new_ki = ki - 1;
+                let new_off = prev_off + 1;
+                if new_ki >= 0 && new_ki < nd {
+                    let j = wf.idx(s, new_ki);
+                    if new_off > wf.d[j] { wf.d[j] = new_off; }
                 }
             }
         }
 
-        // Mismatches
+        // --- Mismatches (from M at s - mismatch) ---
         let sub_s = s - mismatch;
         if sub_s >= 0 {
-            let entries: Vec<_> = wf_m.iter()
-                .filter(|&(&(sc, _), _)| sc == sub_s)
-                .map(|(&(_, k), &off)| (k, off)).collect();
-            for (k, off) in entries {
-                if off < m && (off + k) >= 0 && (off + k) < n {
-                    let noff = off + 1;
-                    if noff > wf_m.get(&(s, k)).copied().unwrap_or(-1) {
-                        wf_m.insert((s, k), noff);
-                        bt.insert((s, k), (sub_s, k, OP_MISMATCH, 0));
+            let (lo, hi) = wf.band(sub_s, gap_extend);
+            for ki in lo..=hi {
+                let prev_off = wf.m[wf.idx(sub_s, ki)];
+                if prev_off == WF_EMPTY { continue; }
+                let k = ki - max_k;
+                let q_pos = prev_off + k;
+                if prev_off < m && q_pos >= 0 && q_pos < n {
+                    let new_off = prev_off + 1;
+                    let j = wf.idx(s, ki);
+                    if new_off > wf.m[j] {
+                        wf.m[j] = new_off;
+                        wf.bt[j] = BtEntry { prev_s: sub_s, prev_k: k, op: OP_MISMATCH, src: COMP_M };
                     }
                 }
             }
         }
 
-        // Merge I -> M
-        let i_entries: Vec<_> = wf_i.iter()
-            .filter(|&(&(sc, _), _)| sc == s)
-            .map(|(&(_, k), &off)| (k, off)).collect();
-        for (k, off) in i_entries {
-            if off > wf_m.get(&(s, k)).copied().unwrap_or(-1) {
-                wf_m.insert((s, k), off);
+        // --- Merge I and D into M ---
+        for ki in lo_s..=hi_s {
+            let j = wf.idx(s, ki);
+            let i_off = wf.i[j];
+            if i_off != WF_EMPTY && i_off > wf.m[j] {
+                wf.m[j] = i_off;
+                let k = ki - max_k;
                 let prev_k = k - 1;
-                let ins_s = s - gap_open - gap_extend;
-                let ins_ext_s = s - gap_extend;
-                if ins_s >= 0 && wf_m.get(&(ins_s, prev_k)).copied().unwrap_or(-1) == off {
-                    bt.insert((s, k), (ins_s, prev_k, OP_INSERTION, 0));
-                } else if ins_ext_s >= 0 && wf_i.get(&(ins_ext_s, prev_k)).copied().unwrap_or(-1) == off {
-                    bt.insert((s, k), (ins_ext_s, prev_k, OP_INSERTION, 1));
-                } else {
-                    bt.insert((s, k), (s, k, OP_INSERTION, 0));
+                let prev_ki = ki - 1;
+                if prev_ki >= 0 && prev_ki < nd {
+                    if ins_s >= 0 && wf.m[wf.idx(ins_s, prev_ki)] == i_off {
+                        wf.bt[j] = BtEntry { prev_s: ins_s, prev_k, op: OP_INSERTION, src: COMP_M };
+                    } else if ins_ext_s >= 0 && wf.i[wf.idx(ins_ext_s, prev_ki)] == i_off {
+                        wf.bt[j] = BtEntry { prev_s: ins_ext_s, prev_k, op: OP_INSERTION, src: COMP_I };
+                    }
                 }
             }
-        }
-
-        // Merge D -> M
-        let d_entries: Vec<_> = wf_d.iter()
-            .filter(|&(&(sc, _), _)| sc == s)
-            .map(|(&(_, k), &off)| (k, off)).collect();
-        for (k, off) in d_entries {
-            if off > wf_m.get(&(s, k)).copied().unwrap_or(-1) {
-                wf_m.insert((s, k), off);
+            let d_off = wf.d[j];
+            if d_off != WF_EMPTY && d_off > wf.m[j] {
+                wf.m[j] = d_off;
+                let k = ki - max_k;
                 let prev_k = k + 1;
-                let del_s = s - gap_open - gap_extend;
-                let del_ext_s = s - gap_extend;
-                if del_s >= 0 && wf_m.get(&(del_s, prev_k)).copied().map(|o| o + 1).unwrap_or(-1) == off {
-                    bt.insert((s, k), (del_s, prev_k, OP_DELETION, 0));
-                } else if del_ext_s >= 0 && wf_d.get(&(del_ext_s, prev_k)).copied().map(|o| o + 1).unwrap_or(-1) == off {
-                    bt.insert((s, k), (del_ext_s, prev_k, OP_DELETION, 2));
-                } else {
-                    bt.insert((s, k), (s, k, OP_DELETION, 0));
-                }
-            }
-        }
-
-        // Extend M
-        let m_keys: Vec<_> = wf_m.iter()
-            .filter(|&(&(sc, _), _)| sc == s)
-            .map(|(&(_, k), _)| k).collect();
-        for k in m_keys {
-            if let Some(off) = wf_m.get_mut(&(s, k)) {
-                while *off < m && (*off + k) >= 0 && (*off + k) < n {
-                    if query[(*off + k) as usize] == reference[*off as usize] {
-                        *off += 1;
-                    } else {
-                        break;
+                let prev_ki = ki + 1;
+                if prev_ki >= 0 && prev_ki < nd {
+                    let from_m = del_s >= 0 && {
+                        let v = wf.m[wf.idx(del_s, prev_ki)];
+                        v != WF_EMPTY && v + 1 == d_off
+                    };
+                    if from_m {
+                        wf.bt[j] = BtEntry { prev_s: del_s, prev_k, op: OP_DELETION, src: COMP_M };
+                    } else if del_ext_s >= 0 {
+                        let v = wf.d[wf.idx(del_ext_s, prev_ki)];
+                        if v != WF_EMPTY && v + 1 == d_off {
+                            wf.bt[j] = BtEntry { prev_s: del_ext_s, prev_k, op: OP_DELETION, src: COMP_D };
+                        }
                     }
                 }
             }
         }
 
-        // Check target
-        if let Some(&off) = wf_m.get(&(s, target_k)) {
-            if off >= m {
-                final_score = s;
-                break;
-            }
+        // --- Extend M wavefront ---
+        for ki in lo_s..=hi_s {
+            let j = wf.idx(s, ki);
+            let off = wf.m[j];
+            if off == WF_EMPTY { continue; }
+            wf.m[j] = extend(off, ki - max_k);
+        }
+
+        // Check if target reached
+        let target_ki = target_k + max_k;
+        if target_ki >= 0 && target_ki < nd && wf.m[wf.idx(s, target_ki)] >= m {
+            final_score = s;
+            break;
         }
     }
 
     if final_score < 0 {
-        return String::from("*");
+        return None;
     }
 
-    // Backtrack
-    let mut ops = Vec::new();
+    // --- Backtrack to reconstruct CIGAR (same rules as the kernel) ---
+    let mut ops: Vec<u8> = Vec::with_capacity((n + m) as usize);
     let mut cur_s = final_score;
     let mut cur_k = target_k;
-    let mut cur_off = wf_m.get(&(cur_s, cur_k)).copied().unwrap_or(m);
+    let mut cur_off = wf.m[wf.idx(cur_s, cur_k + max_k)];
 
     while cur_s > 0 {
-        if let Some(&(prev_s, prev_k, op, src)) = bt.get(&(cur_s, cur_k)) {
-            let prev_off = match src {
-                0 => wf_m.get(&(prev_s, prev_k)).copied().unwrap_or(0),
-                1 => wf_i.get(&(prev_s, prev_k)).copied().unwrap_or(0),
-                2 => wf_d.get(&(prev_s, prev_k)).copied().unwrap_or(0),
-                _ => 0,
-            };
-            let off_after = match op {
-                OP_MISMATCH => prev_off + 1,
-                OP_INSERTION => prev_off,
-                OP_DELETION => prev_off + 1,
-                _ => prev_off,
-            };
-            for _ in 0..(cur_off - off_after) { ops.push(OP_MATCH); }
-            ops.push(op);
-            cur_s = prev_s;
-            cur_k = prev_k;
-            cur_off = prev_off;
-        } else {
+        let bt = wf.bt[wf.idx(cur_s, cur_k + max_k)];
+        if bt.op == BT_NONE {
+            // No backtrack - fill remaining with matches
             while cur_off > 0 { ops.push(OP_MATCH); cur_off -= 1; }
             break;
         }
+        let pj = wf.idx(bt.prev_s, bt.prev_k + max_k);
+        let mut prev_off = match bt.src {
+            COMP_M => wf.m[pj],
+            COMP_I => wf.i[pj],
+            _ => wf.d[pj],
+        };
+        if prev_off == WF_EMPTY { prev_off = 0; }
+        // Offset after the operation (before extend)
+        let off_after_op = match bt.op {
+            OP_MISMATCH | OP_DELETION => prev_off + 1,
+            _ => prev_off,
+        };
+        // Matches from extend, then the operation itself
+        for _ in 0..(cur_off - off_after_op).max(0) { ops.push(OP_MATCH); }
+        ops.push(bt.op);
+        cur_s = bt.prev_s;
+        cur_k = bt.prev_k;
+        cur_off = prev_off;
     }
-    while cur_off > 0 { ops.push(OP_MATCH); cur_off -= 1; }
+    // Remaining matches at score 0
+    if cur_s == 0 {
+        while cur_off > 0 { ops.push(OP_MATCH); cur_off -= 1; }
+    }
     ops.reverse();
-    ops_to_cigar(&ops)
+    Some((final_score, ops_to_cigar(&ops)))
 }
 
 // ============================================================
@@ -1502,15 +1846,55 @@ fn extract_tag_value(desc: Option<&str>, tag_prefix: &str) -> String {
 // K-mer pre-filter
 // ============================================================
 
-/// Collect all unique k-mers from a sequence as owned `Vec<u8>`.
-fn collect_kmers_owned(seq: &[u8], k: usize) -> HashSet<Vec<u8>> {
+/// 2-bit encode a nucleotide; `None` for anything other than A/C/G/T.
+#[inline]
+fn encode_base(b: u8) -> Option<u64> {
+    match b {
+        b'A' => Some(0),
+        b'C' => Some(1),
+        b'G' => Some(2),
+        b'T' => Some(3),
+        _ => None,
+    }
+}
+
+/// Collect the distinct k-mers of `seq` as 2-bit packed `u64`s (k <= 32).
+/// Windows containing a non-ACGT base (e.g. `N`) are skipped. Sequences are
+/// expected to be uppercase (the readers uppercase on load).
+fn collect_kmers_packed(seq: &[u8], k: usize) -> HashSet<u64> {
     let mut set = HashSet::new();
-    if seq.len() >= k {
-        for window in seq.windows(k) {
-            set.insert(window.to_vec());
+    if k == 0 || k > MAX_KMER_LEN || seq.len() < k {
+        return set;
+    }
+    let mask: u64 = if k == MAX_KMER_LEN { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mut kmer: u64 = 0;
+    let mut valid = 0usize;
+    for &b in seq {
+        match encode_base(b) {
+            Some(code) => {
+                kmer = ((kmer << 2) | code) & mask;
+                valid += 1;
+                if valid >= k {
+                    set.insert(kmer);
+                }
+            }
+            None => {
+                kmer = 0;
+                valid = 0;
+            }
         }
     }
     set
+}
+
+/// True when at least `threshold` of the read's k-mers occur in the reference.
+/// A read with no valid k-mers (shorter than k, or all ambiguous) passes.
+fn kmer_fraction_passes(read_kmers: &HashSet<u64>, ref_kmers: &HashSet<u64>, threshold: f64) -> bool {
+    if read_kmers.is_empty() {
+        return true;
+    }
+    let hits = read_kmers.iter().filter(|k| ref_kmers.contains(k)).count();
+    (hits as f64 / read_kmers.len() as f64) >= threshold
 }
 
 // ============================================================
@@ -1518,30 +1902,21 @@ fn collect_kmers_owned(seq: &[u8], k: usize) -> HashSet<Vec<u8>> {
 // ============================================================
 
 fn pack_sequences(records: &[SequenceRecord]) -> (Vec<i8>, Vec<usize>, Vec<usize>) {
-    let mut data = Vec::new();
-    let mut lengths = Vec::new();
-    let mut offsets = Vec::new();
-    for rec in records {
-        offsets.push(data.len());
-        lengths.push(rec.seq.len());
-        for &b in &rec.seq {
-            data.push(b as i8);
-        }
-    }
-    (data, lengths, offsets)
+    let seqs: Vec<&[u8]> = records.iter().map(|r| r.seq.as_slice()).collect();
+    pack_sequences_raw(&seqs)
 }
 
-/// Pack raw byte sequences (e.g., reverse complements) for GPU transfer.
-fn pack_sequences_raw(seqs: &[Vec<u8>]) -> (Vec<i8>, Vec<usize>, Vec<usize>) {
-    let mut data = Vec::new();
-    let mut lengths = Vec::new();
-    let mut offsets = Vec::new();
+/// Pack raw byte sequences (e.g., unique reads or their reverse complements)
+/// into one buffer plus per-sequence lengths and offsets for GPU transfer.
+fn pack_sequences_raw(seqs: &[&[u8]]) -> (Vec<i8>, Vec<usize>, Vec<usize>) {
+    let total: usize = seqs.iter().map(|s| s.len()).sum();
+    let mut data = Vec::with_capacity(total);
+    let mut lengths = Vec::with_capacity(seqs.len());
+    let mut offsets = Vec::with_capacity(seqs.len());
     for seq in seqs {
         offsets.push(data.len());
         lengths.push(seq.len());
-        for &b in seq {
-            data.push(b as i8);
-        }
+        data.extend(seq.iter().map(|&b| b as i8));
     }
     (data, lengths, offsets)
 }
@@ -1590,7 +1965,9 @@ impl BatchReader for FastaBatchReader {
             batch.push(SequenceRecord {
                 id: record.id().to_string(),
                 desc: record.desc().map(|d| d.to_string()),
-                seq: record.seq().to_vec(),
+                // Uppercase so alignment is case-insensitive and identical
+                // sequences deduplicate regardless of input case.
+                seq: record.seq().to_ascii_uppercase(),
             });
         }
         Ok(batch)
@@ -1617,7 +1994,7 @@ impl BatchReader for FastqBatchReader {
             batch.push(SequenceRecord {
                 id: record.id().to_string(),
                 desc: record.desc().map(|d| d.to_string()),
-                seq: record.seq().to_vec(),
+                seq: record.seq().to_ascii_uppercase(),
             });
         }
         Ok(batch)
@@ -1670,4 +2047,305 @@ fn setup_logging(verbosity: u8) {
         _ => log::LevelFilter::Trace,
     };
     env_logger::Builder::new().filter_level(level).init();
+}
+
+// ============================================================
+// Tests (CPU only; no GPU required)
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(id: &str, desc: Option<&str>, seq: &str) -> SequenceRecord {
+        SequenceRecord {
+            id: id.to_string(),
+            desc: desc.map(|d| d.to_string()),
+            seq: seq.as_bytes().to_vec(),
+        }
+    }
+
+    /// Fabricate GPU results for a prepared batch: forward pairs align
+    /// perfectly (score 0, all matches), RC pairs are all mismatches (score
+    /// `rc_score`). Pairs listed in `gpu_failed` get score -1 (CPU fallback).
+    fn fake_gpu_result(prepared: PreparedBatch, rc_score: i32, gpu_failed: &[usize]) -> GpuBatchResult {
+        let n = prepared.pair_query_idx.len();
+        let mut scores = vec![0i32; n];
+        let mut cigar_ops: Vec<Vec<i8>> = vec![Vec::new(); n];
+        let mut cigar_lengths = vec![0i32; n];
+        for i in 0..n {
+            let ui = prepared.pair_query_idx[i] as usize;
+            let len = prepared.query_lengths[ui] as usize;
+            if gpu_failed.contains(&i) {
+                scores[i] = -1;
+                continue;
+            }
+            if prepared.pair_is_rc[i] {
+                scores[i] = rc_score;
+                cigar_ops[i] = vec![OP_MISMATCH as i8; len];
+            } else {
+                scores[i] = 0;
+                cigar_ops[i] = vec![OP_MATCH as i8; len];
+            }
+            cigar_lengths[i] = len as i32;
+        }
+        GpuBatchResult { prepared, scores, cigar_ops, cigar_lengths }
+    }
+
+    #[test]
+    fn dedup_maps_reads_to_first_seen_unique() {
+        let batch = vec![
+            rec("r0", None, "ACGT"), rec("r1", None, "TTTT"), rec("r2", None, "ACGT"),
+            rec("r3", None, "GGCC"), rec("r4", None, "TTTT"),
+        ];
+        let (rep, map) = dedup_reads(&batch, true);
+        assert_eq!(rep, vec![0, 1, 3]);
+        assert_eq!(map, vec![0, 1, 0, 2, 1]);
+
+        let (rep, map) = dedup_reads(&batch, false);
+        assert_eq!(rep, vec![0, 1, 2, 3, 4]);
+        assert_eq!(map, rep);
+    }
+
+    #[test]
+    fn prepare_batch_aligns_unique_sequences_only() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC"), rec("refB", None, "TTTTGGGGCC")];
+        let batch = vec![
+            rec("r0", None, "ACGTACGTAC"), rec("r1", None, "ACGTACGTAC"), rec("r2", None, "TTTTGGGGCC"),
+        ];
+        let p = prepare_batch(batch, &refs, &[], false, 0, 0.5, true, 500);
+        assert_eq!(p.num_reads, 3);
+        assert_eq!(p.num_unique, 2);
+        assert_eq!(p.read_to_uidx, vec![0, 0, 1]);
+        assert_eq!(p.query_lengths, vec![10, 10]);
+        assert_eq!(p.rc_query_lengths, vec![10, 10]);
+        // 2 unique x 2 refs x 2 orientations, all referencing unique indices
+        assert_eq!(p.pair_query_idx.len(), 8);
+        assert!(p.pair_query_idx.iter().all(|&q| (q as usize) < 2));
+        assert_eq!(p.too_long, vec![false, false]);
+        assert_eq!(p.kmer_fail_count, 0);
+    }
+
+    #[test]
+    fn too_long_reads_get_no_pairs() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC")];
+        let batch = vec![rec("short", None, "ACGTAC"), rec("long", None, "ACGTACGTACGTACGT")];
+        let p = prepare_batch(batch, &refs, &[], false, 0, 0.5, true, 10);
+        assert_eq!(p.too_long, vec![false, true]);
+        assert_eq!(p.pair_query_idx.len(), 2); // the short read only, both orientations
+        assert!(p.pair_query_idx.iter().all(|&q| q == 0));
+        assert_eq!(p.fwd_gpu_idx[1], None);
+        assert_eq!(p.rc_gpu_idx[1], None);
+    }
+
+    #[test]
+    fn kmer_filter_rejects_unrelated_pairs() {
+        let refs = vec![rec("refA", None, "ACGTACGTACGTACGT")];
+        let ref_sets: Vec<HashSet<u64>> = refs.iter().map(|r| collect_kmers_packed(&r.seq, 4)).collect();
+        let batch = vec![
+            rec("same", None, "ACGTACGTACGTACGT"),
+            rec("polyT", None, "TTTTTTTTTTTTTTTT"),
+        ];
+        let p = prepare_batch(batch, &refs, &ref_sets, true, 4, 0.5, true, 500);
+        assert!(p.fwd_kmer_pass[0]);
+        assert!(!p.fwd_kmer_pass[1]);
+        assert!(!p.rc_kmer_pass[1]); // RC of polyT is polyA: still no shared 4-mers
+        assert_eq!(p.kmer_fail_count, 1);
+    }
+
+    #[test]
+    fn packed_kmers_skip_ambiguous_bases() {
+        let set = collect_kmers_packed(b"ACGTN", 2);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&0b0001)); // AC
+        assert!(set.contains(&0b0110)); // CG
+        assert!(set.contains(&0b1011)); // GT
+        assert!(collect_kmers_packed(b"NNNN", 2).is_empty());
+        assert!(collect_kmers_packed(b"ACG", 4).is_empty()); // shorter than k
+        assert_eq!(collect_kmers_packed(b"ACGTACGT", 4).len(), 4); // ACGT CGTA GTAC TACG
+        // A window straddling an N is dropped, but k-mers after it resume.
+        assert_eq!(collect_kmers_packed(b"ACGTNACGT", 4).len(), 1);
+        // k = 32 exercises the full-width mask.
+        let s33 = b"ACGTACGTACGTACGTACGTACGTACGTACGTA";
+        assert_eq!(s33.len(), 33);
+        assert_eq!(collect_kmers_packed(s33, 32).len(), 2);
+    }
+
+    #[test]
+    fn kmer_fraction_threshold() {
+        let r = collect_kmers_packed(b"ACGTACGT", 4);
+        let same = collect_kmers_packed(b"ACGTACGT", 4);
+        let half = collect_kmers_packed(b"ACGTTTTT", 4); // ACGT shared, CGTT GTTT TTTT not
+        assert!(kmer_fraction_passes(&same, &r, 0.99));
+        assert!(kmer_fraction_passes(&half, &r, 0.25));
+        assert!(!kmer_fraction_passes(&half, &r, 0.5));
+        assert!(kmer_fraction_passes(&HashSet::new(), &r, 1.0)); // no k-mers: pass
+    }
+
+    #[test]
+    fn cpu_align_cases() {
+        let (go, ge, mm) = (2, 1, 4);
+        assert_eq!(cpu_align(b"ACGTACGT", b"ACGTACGT", go, ge, mm, 0), Some((0, "8=".to_string())));
+        assert_eq!(cpu_align(b"ACGAACGT", b"ACGTACGT", go, ge, mm, 0), Some((4, "3=1X4=".to_string())));
+        assert_eq!(cpu_align(b"ACGTTACG", b"ACGTACG", go, ge, mm, 0), Some((3, "4=1I3=".to_string())));
+        assert_eq!(cpu_align(b"ACGTACG", b"ACGTTACG", go, ge, mm, 0), Some((3, "4=1D3=".to_string())));
+        // Multi-base deletion: open + 2 extensions = 2 + 3*1 = 5
+        let reference = b"ACGTTGCAAGTCCATGGACT";
+        let mut query = reference[..8].to_vec();
+        query.extend_from_slice(&reference[11..]);
+        assert_eq!(cpu_align(&query, reference, go, ge, mm, 0), Some((5, "8=3D9=".to_string())));
+        // Multi-base insertion, pe_23amp penalties (-g 5 -e 1 -m 3): 5 + 3*1 = 8
+        assert_eq!(cpu_align(reference, &query, 5, 1, 3, 0), Some((8, "8=3I9=".to_string())));
+    }
+
+    #[test]
+    fn cpu_align_scores_are_comparable_across_orientations() {
+        // Divergent pair: still aligns (within CPU_MAX_SCORE) with a high score.
+        let (score, cigar) = cpu_align(b"TTTTGGGGCC", b"ACGTACGTAC", 2, 1, 4, 0).unwrap();
+        assert!(score > 0);
+        assert!(!cigar.is_empty());
+    }
+
+    #[test]
+    fn format_rows_fan_out_matches_per_read_output() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC"), rec("refB", None, "TTTTGGGGCC")];
+        let batch = vec![
+            rec("r0", Some("RG:Z:c1"), "ACGTACGTAC"),
+            rec("r1", Some("RG:Z:c1"), "ACGTACGTAC"),
+            rec("r2", Some("RG:Z:c2"), "ACGTACGTAC"),
+            rec("r3", Some("RG:Z:c1"), "TTTTGGGGCC"),
+        ];
+        let tags = vec!["RG:Z:".to_string()];
+
+        let with = fake_gpu_result(prepare_batch(batch.clone(), &refs, &[], false, 0, 0.5, true, 500), 7, &[]);
+        let without = fake_gpu_result(prepare_batch(batch, &refs, &[], false, 0, 0.5, false, 500), 7, &[]);
+        let a = format_batch_rows(&with, &refs, &tags, 2, 1, 4, 0, false, false);
+        let b = format_batch_rows(&without, &refs, &tags, 2, 1, 4, 0, false, false);
+
+        assert_eq!(a.rows.len(), 8); // 4 reads x 2 refs
+        assert_eq!(a.rows, b.rows);
+        assert_eq!(a.rows[0], vec!["r0", "refA", "10=", "+", "c1"]);
+        assert_eq!(a.rows[1], vec!["r0", "refB", "10=", "+", "c1"]);
+        assert_eq!(a.rows[4], vec!["r2", "refA", "10=", "+", "c2"]);
+        assert_eq!(a.rows[6], vec!["r3", "refA", "10=", "+", "c1"]);
+        assert_eq!(a.cpu_fallbacks, 0);
+        assert_eq!(a.too_long_reads, 0);
+    }
+
+    #[test]
+    fn collapse_groups_by_sequence_and_tags() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC"), rec("refB", None, "TTTTGGGGCC")];
+        let batch = vec![
+            rec("r0", Some("RG:Z:c1"), "ACGTACGTAC"),
+            rec("r1", Some("RG:Z:c1"), "ACGTACGTAC"),
+            rec("r2", Some("RG:Z:c2"), "ACGTACGTAC"),
+            rec("r3", Some("RG:Z:c1"), "TTTTGGGGCC"),
+        ];
+        let tags = vec!["RG:Z:".to_string()];
+        let res = fake_gpu_result(prepare_batch(batch, &refs, &[], false, 0, 0.5, true, 500), 7, &[]);
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, true);
+
+        assert_eq!(out.rows.len(), 6); // 3 groups x 2 refs
+        assert_eq!(out.rows[0], vec!["r0", "refA", "10=", "+", "c1", "2"]);
+        assert_eq!(out.rows[1], vec!["r0", "refB", "10=", "+", "c1", "2"]);
+        assert_eq!(out.rows[2], vec!["r2", "refA", "10=", "+", "c2", "1"]);
+        assert_eq!(out.rows[4], vec!["r3", "refA", "10=", "+", "c1", "1"]);
+        let sum_ref_a: usize = out.rows.iter().filter(|r| r[1] == "refA").map(|r| r[5].parse::<usize>().unwrap()).sum();
+        assert_eq!(sum_ref_a, 4);
+    }
+
+    #[test]
+    fn cpu_fallback_uses_real_scores_to_pick_strand() {
+        // One unique sequence vs one reference; the forward GPU result "fails"
+        // (score -1) so the CPU re-aligns it. The RC result is a fabricated
+        // all-mismatch alignment with score 7.
+        let refs = vec![rec("refA", None, "ACGTACGTAC")];
+        let tags: Vec<String> = Vec::new();
+
+        // Case 1: the sequence equals the reference, CPU forward score 0 beats RC 7.
+        let p = prepare_batch(vec![rec("r0", None, "ACGTACGTAC")], &refs, &[], false, 0, 0.5, true, 500);
+        let fwd_idx = p.fwd_gpu_idx[0].unwrap();
+        let res = fake_gpu_result(p, 7, &[fwd_idx]);
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
+        assert_eq!(out.rows, vec![vec!["r0", "refA", "10=", "+"]]);
+        assert_eq!(out.cpu_fallbacks, 1);
+
+        // Case 2: the sequence is unrelated, CPU forward score is high, RC 7 wins.
+        let p = prepare_batch(vec![rec("r0", None, "TTTTGGGGCC")], &refs, &[], false, 0, 0.5, true, 500);
+        let fwd_idx = p.fwd_gpu_idx[0].unwrap();
+        let res = fake_gpu_result(p, 7, &[fwd_idx]);
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
+        assert_eq!(out.rows, vec![vec!["r0", "refA", "10X", "-"]]);
+        assert_eq!(out.cpu_fallbacks, 1);
+    }
+
+    #[test]
+    fn too_long_and_failed_rows() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC")];
+        let ref_sets: Vec<HashSet<u64>> = refs.iter().map(|r| collect_kmers_packed(&r.seq, 4)).collect();
+        let batch = vec![
+            rec("long", None, "ACGTACGTACGTACGTACGT"),
+            rec("polyT", None, "TTTTTTTTTT"),
+        ];
+        let p = prepare_batch(batch, &refs, &ref_sets, true, 4, 0.5, true, 12);
+        let res = fake_gpu_result(p, 7, &[]);
+        let tags: Vec<String> = Vec::new();
+
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
+        assert_eq!(out.rows, vec![
+            vec!["long", "refA", "*", "."],
+            vec!["polyT", "refA", "FAILED", "."],
+        ]);
+        assert_eq!(out.too_long_reads, 1);
+        assert_eq!(out.longest_read, 20);
+
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, true, false);
+        assert_eq!(out.rows, vec![vec!["long", "refA", "*", "."]]); // --skip-fail drops FAILED only
+    }
+
+    #[test]
+    fn helpers() {
+        assert_eq!(ops_to_cigar(&[0, 0, 1, 0, 2, 2, 3]), "2=1X1=2I1D");
+        assert_eq!(ops_to_cigar(&[]), "");
+        assert_eq!(reverse_complement(b"ACGTN"), b"NACGT".to_vec());
+        assert_eq!(reverse_complement(b"acgt"), b"ACGT".to_vec());
+        assert_eq!(extract_tag_value(Some("RG:Z:CELL1 merged_150_120"), "RG:Z:"), "CELL1");
+        assert_eq!(extract_tag_value(Some("RG:Z:CELL1 merged_150_120"), "merged"), "_150_120");
+        assert_eq!(extract_tag_value(None, "RG:Z:"), "");
+        assert_eq!(dedup_ratio(10, 4), 2.5);
+        assert_eq!(dedup_ratio(0, 0), 1.0);
+    }
+
+    /// Cross-check the CPU aligner against the CUDA kernel compiled as host
+    /// C++ (`tools/kernel_emulate.cpp`). Set `BLEP_KERNEL_EMULATION_TSV` to the
+    /// harness output to enable; without it this test is a no-op.
+    #[test]
+    fn cpu_align_matches_kernel_emulation() {
+        let Ok(path) = std::env::var("BLEP_KERNEL_EMULATION_TSV") else { return; };
+        let text = std::fs::read_to_string(&path).expect("read kernel emulation TSV");
+        let mut checked = 0usize;
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 9 { continue; }
+            let (q, r) = (f[0].as_bytes(), f[1].as_bytes());
+            let go: i32 = f[2].parse().unwrap();
+            let ge: i32 = f[3].parse().unwrap();
+            let mm: i32 = f[4].parse().unwrap();
+            let max_score: i32 = f[5].parse().unwrap();
+            let max_k: usize = f[6].parse().unwrap();
+            let score: i32 = f[7].parse().unwrap();
+            let cigar = f[8];
+            let got = cpu_align(q, r, go, ge, mm, max_k);
+            if score >= 0 {
+                assert_eq!(got, Some((score, cigar.to_string())), "pair {} vs {}", f[0], f[1]);
+            } else {
+                // The kernel gave up at max_score; the CPU (cap 4096) must not find a cheaper alignment.
+                assert!(got.as_ref().map_or(true, |(s, _)| *s > max_score),
+                        "pair {} vs {}: kernel exceeded {} but CPU found {:?}", f[0], f[1], max_score, got);
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "emulation TSV had no pairs");
+        eprintln!("cross-checked {} pairs against the kernel emulation", checked);
+    }
 }
