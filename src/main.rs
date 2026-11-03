@@ -121,8 +121,11 @@ struct Args {
 
     /// Collapse the output: emit one row per (read sequence, header-tag values)
     /// group instead of one row per read, with a trailing `n_reads` column
-    /// giving the number of reads in the group. `read_name` is the first read
-    /// of the group. Groups are formed within a batch.
+    /// giving the number of reads in the group. Consecutive reads that share a
+    /// name (unmerged mates written by fastp) are collapsed as one unit and
+    /// keep one shared `read_name`, so mates can still be paired downstream;
+    /// `n_reads` then counts pairs. `read_name` is the first read of the group.
+    /// Groups are formed within a batch.
     #[clap(long)]
     collapse: bool,
 
@@ -234,12 +237,12 @@ fn main() -> Result<()> {
         }
     }
 
-    // Build packed k-mer sets for each reference (used by the prep threads' pre-filter)
-    let ref_kmer_sets_owned: Vec<HashSet<u64>> = if kmer_filter_enabled {
-        references.iter().map(|r| collect_kmers_packed(&r.seq, args.kmer_length)).collect()
-    } else {
-        Vec::new()
-    };
+    // Inverted k-mer index over the references (used by the prep threads' pre-filter)
+    let kmer_index = KmerIndex::build(&references, if kmer_filter_enabled { args.kmer_length } else { 0 });
+    if kmer_filter_enabled {
+        info!("K-mer index: {} distinct {}-mers across {} references",
+              kmer_index.len(), args.kmer_length, references.len());
+    }
 
     // Pack reference sequences once on the host; each worker uploads its own
     // copy to its device. Shared across worker threads via Arc.
@@ -251,7 +254,7 @@ fn main() -> Result<()> {
     // Reference records shared read-only with the prep pool (k-mer filter) and
     // the post pool (output formatting + CPU fallback).
     let references_arc = Arc::new(references);
-    let ref_kmer_sets_arc = Arc::new(ref_kmer_sets_owned);
+    let kmer_index_arc = Arc::new(kmer_index);
 
     // Create the output writer and emit the header row up front. The writer is
     // then moved into a single dedicated writer thread (below).
@@ -371,7 +374,7 @@ fn main() -> Result<()> {
         let raw_rx = Arc::clone(&raw_rx);
         let prep_tx = prep_tx.clone();
         let references_arc = Arc::clone(&references_arc);
-        let ref_kmer_sets_arc = Arc::clone(&ref_kmer_sets_arc);
+        let kmer_index_arc = Arc::clone(&kmer_index_arc);
         let handle = thread::spawn(move || -> Result<StageStats> {
             let mut stats = StageStats::default();
             loop {
@@ -390,7 +393,7 @@ fn main() -> Result<()> {
                 let prepared = prepare_batch(
                     batch,
                     &references_arc,
-                    &ref_kmer_sets_arc,
+                    &kmer_index_arc,
                     kmer_filter_enabled,
                     kmer_length,
                     kmer_threshold,
@@ -883,7 +886,7 @@ fn dedup_reads(batch: &[SequenceRecord], dedup: bool) -> (Vec<usize>, Vec<usize>
 fn prepare_batch(
     batch: Vec<SequenceRecord>,
     references: &[SequenceRecord],
-    ref_kmer_sets: &[HashSet<u64>],
+    kmer_index: &KmerIndex,
     kmer_filter_enabled: bool,
     kmer_length: usize,
     kmer_threshold: f64,
@@ -920,6 +923,8 @@ fn prepare_batch(
     let mut fwd_kmer_pass = vec![true; num_pairs];
     let mut rc_kmer_pass = vec![true; num_pairs];
     let mut kmer_fail_count = 0usize;
+    // Scratch: shared k-mer count per reference for the sequence being filtered.
+    let mut shared = vec![0u32; num_refs];
 
     for ui in 0..num_unique {
         if too_long[ui] {
@@ -933,15 +938,22 @@ fn prepare_batch(
         if !kmer_filter_enabled {
             continue;
         }
-        let fwd_kmers = collect_kmers_packed(unique_seqs[ui], kmer_length);
-        let rc_kmers = collect_kmers_packed(&rc_seqs[ui], kmer_length);
 
+        // One index lookup per read k-mer yields the shared count for every
+        // reference at once; the pass test per reference is then a division.
+        let fwd_kmers = collect_kmers_packed(unique_seqs[ui], kmer_length);
+        kmer_index.count_shared(&fwd_kmers, &mut shared);
+        for ri in 0..num_refs {
+            if !kmer_fraction_passes(shared[ri] as usize, fwd_kmers.len(), kmer_threshold) {
+                fwd_kmer_pass[ui * num_refs + ri] = false;
+            }
+        }
+
+        let rc_kmers = collect_kmers_packed(&rc_seqs[ui], kmer_length);
+        kmer_index.count_shared(&rc_kmers, &mut shared);
         for ri in 0..num_refs {
             let global_idx = ui * num_refs + ri;
-            if !kmer_fraction_passes(&fwd_kmers, &ref_kmer_sets[ri], kmer_threshold) {
-                fwd_kmer_pass[global_idx] = false;
-            }
-            if !kmer_fraction_passes(&rc_kmers, &ref_kmer_sets[ri], kmer_threshold) {
+            if !kmer_fraction_passes(shared[ri] as usize, rc_kmers.len(), kmer_threshold) {
                 rc_kmer_pass[global_idx] = false;
             }
             // Count pairs where BOTH orientations fail
@@ -1198,13 +1210,17 @@ fn push_row(
     rows.push(row);
 }
 
-/// A set of reads in one batch that share a unique sequence and header-tag
-/// values (collapsed output mode).
+/// Collapsed output mode: a set of *templates* in one batch that are
+/// indistinguishable. A template is a run of consecutive reads sharing a name
+/// (a single merged read, or the two mates of an unmerged pair); its identity
+/// is the ordered list of its members' (unique sequence, tag values).
 struct ReadGroup {
+    /// Index of the first read of the first template; its name labels every row.
     first_read: usize,
-    uidx: usize,
-    tag_values: Vec<String>,
-    n_reads: usize,
+    /// (unique sequence index, tag values) for each member of the template.
+    members: Vec<(usize, Vec<String>)>,
+    /// How many templates collapsed into this group (the `n_reads` column).
+    n_templates: usize,
 }
 
 /// Build the TSV output rows for one batch from its GPU results.
@@ -1213,8 +1229,9 @@ struct ReadGroup {
 /// orientation, transparently re-aligning on the CPU any orientation the GPU
 /// could not finish within the score budget. Step 2 fans the resolved calls out
 /// to the reads: one row per read x reference in input order (rows for a read
-/// stay contiguous), or, with `collapse`, one row per (sequence, tag values)
-/// group x reference with a trailing `n_reads` column.
+/// stay contiguous), or, with `collapse`, one row per group x reference with a
+/// trailing `n_reads` column, where a group is a set of identical templates
+/// (a merged read, or an unmerged pair sharing one name) from the same cell.
 ///
 /// `max_k` is the kernel's diagonal half-range (`max(max_read_length,
 /// max_ref_length)`), passed to the CPU fallback so it explores exactly the
@@ -1315,32 +1332,49 @@ fn format_batch_rows(
             }
         }
     } else {
-        // Group reads by (unique sequence, tag values), first-seen order.
-        let mut group_of: HashMap<(usize, Vec<String>), usize> = HashMap::new();
+        // Collapsed mode. Consecutive reads sharing a name (unmerged mates, as
+        // fastp writes them) form one template. Templates with identical
+        // members, i.e. the same ordered (unique sequence, tag values) list,
+        // collapse into one group in first-seen order. Every member still gets
+        // its own rows, all under the group's first read name, so downstream
+        // code can pair mates up again; `n_reads` counts templates.
+        let mut group_of: HashMap<Vec<(usize, Vec<String>)>, usize> = HashMap::new();
         let mut groups: Vec<ReadGroup> = Vec::new();
-        for qi in 0..prepared.num_reads {
-            let ui = prepared.read_to_uidx[qi];
-            if prepared.too_long[ui] {
-                too_long_reads += 1;
-                longest_read = longest_read.max(prepared.batch[qi].seq.len());
+        let mut start = 0;
+        while start < prepared.num_reads {
+            let mut end = start + 1;
+            while end < prepared.num_reads && prepared.batch[end].id == prepared.batch[start].id {
+                end += 1;
             }
-            let tag_values = tag_values_for(qi);
-            match group_of.entry((ui, tag_values)) {
-                Entry::Occupied(e) => groups[*e.get()].n_reads += 1,
+            let mut members = Vec::with_capacity(end - start);
+            for qi in start..end {
+                let ui = prepared.read_to_uidx[qi];
+                if prepared.too_long[ui] {
+                    too_long_reads += 1;
+                    longest_read = longest_read.max(prepared.batch[qi].seq.len());
+                }
+                members.push((ui, tag_values_for(qi)));
+            }
+            match group_of.entry(members) {
+                Entry::Occupied(e) => groups[*e.get()].n_templates += 1,
                 Entry::Vacant(e) => {
-                    let tag_values = e.key().1.clone();
+                    let members = e.key().clone();
                     e.insert(groups.len());
-                    groups.push(ReadGroup { first_read: qi, uidx: ui, tag_values, n_reads: 1 });
+                    groups.push(ReadGroup { first_read: start, members, n_templates: 1 });
                 }
             }
+            start = end;
         }
         for g in &groups {
-            for ri in 0..num_refs {
-                push_row(
-                    &mut rows, &calls[g.uidx * num_refs + ri],
-                    &prepared.batch[g.first_read].id, &references[ri].id,
-                    &g.tag_values, Some(g.n_reads), skip_fail,
-                );
+            let name = &prepared.batch[g.first_read].id;
+            for (ui, tag_values) in &g.members {
+                for ri in 0..num_refs {
+                    push_row(
+                        &mut rows, &calls[ui * num_refs + ri],
+                        name, &references[ri].id,
+                        tag_values, Some(g.n_templates), skip_fail,
+                    );
+                }
             }
         }
     }
@@ -1887,14 +1921,64 @@ fn collect_kmers_packed(seq: &[u8], k: usize) -> HashSet<u64> {
     set
 }
 
-/// True when at least `threshold` of the read's k-mers occur in the reference.
-/// A read with no valid k-mers (shorter than k, or all ambiguous) passes.
-fn kmer_fraction_passes(read_kmers: &HashSet<u64>, ref_kmers: &HashSet<u64>, threshold: f64) -> bool {
-    if read_kmers.is_empty() {
+/// Inverted k-mer index over the references: for every distinct packed k-mer
+/// that occurs in any reference, the sorted list of references containing it.
+/// The pre-filter counts shared k-mers for all references with one lookup per
+/// read k-mer, so its cost per read does not grow with the number of
+/// references. Built once at startup and shared read-only by the prep pool.
+struct KmerIndex {
+    num_refs: usize,
+    refs_by_kmer: HashMap<u64, Vec<u32>>,
+}
+
+impl KmerIndex {
+    /// Build the index for `k`-mers (k = 0 yields an empty index, used when the
+    /// filter is disabled).
+    fn build(references: &[SequenceRecord], k: usize) -> Self {
+        let mut refs_by_kmer: HashMap<u64, Vec<u32>> = HashMap::new();
+        if k > 0 {
+            for (ri, r) in references.iter().enumerate() {
+                // collect_kmers_packed yields each k-mer once per reference and
+                // references are visited in order, so every list is sorted and
+                // has no duplicates.
+                for kmer in collect_kmers_packed(&r.seq, k) {
+                    refs_by_kmer.entry(kmer).or_default().push(ri as u32);
+                }
+            }
+        }
+        KmerIndex { num_refs: references.len(), refs_by_kmer }
+    }
+
+    /// Number of distinct k-mers in the index.
+    fn len(&self) -> usize {
+        self.refs_by_kmer.len()
+    }
+
+    /// For each reference, count how many of `read_kmers` it contains. `shared`
+    /// is a caller-owned scratch slice of length `num_refs`; it is overwritten.
+    /// This equals, for every reference, the number of distinct read k-mers found
+    /// in that reference's k-mer set.
+    fn count_shared(&self, read_kmers: &HashSet<u64>, shared: &mut [u32]) {
+        debug_assert_eq!(shared.len(), self.num_refs);
+        shared.fill(0);
+        for kmer in read_kmers {
+            if let Some(refs) = self.refs_by_kmer.get(kmer) {
+                for &ri in refs {
+                    shared[ri as usize] += 1;
+                }
+            }
+        }
+    }
+}
+
+/// True when at least `threshold` of a read's `total` distinct k-mers (`hits` of
+/// them) occur in the reference. A read with no valid k-mers (shorter than k, or
+/// all ambiguous) passes.
+fn kmer_fraction_passes(hits: usize, total: usize, threshold: f64) -> bool {
+    if total == 0 {
         return true;
     }
-    let hits = read_kmers.iter().filter(|k| ref_kmers.contains(k)).count();
-    (hits as f64 / read_kmers.len() as f64) >= threshold
+    (hits as f64 / total as f64) >= threshold
 }
 
 // ============================================================
@@ -1945,59 +2029,93 @@ trait BatchReader {
     fn read_batch(&mut self, batch_size: usize) -> Result<Vec<SequenceRecord>>;
 }
 
+/// Shared batching logic. Pull records until `batch_size` is reached, then
+/// keep going while the next record has the same name as the last one, so
+/// consecutive same-name records (unmerged mates as fastp writes them) never
+/// straddle a batch boundary. A record read past the boundary is parked in
+/// `pending` for the next call. Sequences are uppercased so alignment is
+/// case-insensitive and identical sequences deduplicate regardless of case.
+fn fill_batch<F>(
+    pending: &mut Option<SequenceRecord>,
+    batch_size: usize,
+    mut next: F,
+) -> Result<Vec<SequenceRecord>>
+where
+    F: FnMut() -> Result<Option<SequenceRecord>>,
+{
+    let mut batch = Vec::with_capacity(batch_size + 1);
+    if let Some(rec) = pending.take() {
+        batch.push(rec);
+    }
+    loop {
+        let rec = match next()? {
+            Some(r) => r,
+            None => break,
+        };
+        if batch.len() >= batch_size && batch.last().map_or(false, |last| last.id != rec.id) {
+            *pending = Some(rec);
+            break;
+        }
+        batch.push(rec);
+    }
+    Ok(batch)
+}
+
 struct FastaBatchReader {
     reader: fasta::Reader<BufReader<Box<dyn Read>>>,
+    pending: Option<SequenceRecord>,
 }
 
 impl FastaBatchReader {
     fn new(reader: Box<dyn Read>) -> Self {
-        Self { reader: fasta::Reader::from_bufread(BufReader::new(reader)) }
+        Self { reader: fasta::Reader::from_bufread(BufReader::new(reader)), pending: None }
     }
 }
 
 impl BatchReader for FastaBatchReader {
     fn read_batch(&mut self, batch_size: usize) -> Result<Vec<SequenceRecord>> {
-        let mut batch = Vec::with_capacity(batch_size);
         let mut record = fasta::Record::new();
-        for _ in 0..batch_size {
-            self.reader.read(&mut record)?;
-            if record.is_empty() { break; }
-            batch.push(SequenceRecord {
+        let reader = &mut self.reader;
+        fill_batch(&mut self.pending, batch_size, || {
+            reader.read(&mut record)?;
+            if record.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(SequenceRecord {
                 id: record.id().to_string(),
                 desc: record.desc().map(|d| d.to_string()),
-                // Uppercase so alignment is case-insensitive and identical
-                // sequences deduplicate regardless of input case.
                 seq: record.seq().to_ascii_uppercase(),
-            });
-        }
-        Ok(batch)
+            }))
+        })
     }
 }
 
 struct FastqBatchReader {
     reader: fastq::Reader<BufReader<Box<dyn Read>>>,
+    pending: Option<SequenceRecord>,
 }
 
 impl FastqBatchReader {
     fn new(reader: Box<dyn Read>) -> Self {
-        Self { reader: fastq::Reader::from_bufread(BufReader::new(reader)) }
+        Self { reader: fastq::Reader::from_bufread(BufReader::new(reader)), pending: None }
     }
 }
 
 impl BatchReader for FastqBatchReader {
     fn read_batch(&mut self, batch_size: usize) -> Result<Vec<SequenceRecord>> {
-        let mut batch = Vec::with_capacity(batch_size);
         let mut record = fastq::Record::new();
-        for _ in 0..batch_size {
-            self.reader.read(&mut record)?;
-            if record.is_empty() { break; }
-            batch.push(SequenceRecord {
+        let reader = &mut self.reader;
+        fill_batch(&mut self.pending, batch_size, || {
+            reader.read(&mut record)?;
+            if record.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(SequenceRecord {
                 id: record.id().to_string(),
                 desc: record.desc().map(|d| d.to_string()),
                 seq: record.seq().to_ascii_uppercase(),
-            });
-        }
-        Ok(batch)
+            }))
+        })
     }
 }
 
@@ -2113,7 +2231,7 @@ mod tests {
         let batch = vec![
             rec("r0", None, "ACGTACGTAC"), rec("r1", None, "ACGTACGTAC"), rec("r2", None, "TTTTGGGGCC"),
         ];
-        let p = prepare_batch(batch, &refs, &[], false, 0, 0.5, true, 500);
+        let p = prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500);
         assert_eq!(p.num_reads, 3);
         assert_eq!(p.num_unique, 2);
         assert_eq!(p.read_to_uidx, vec![0, 0, 1]);
@@ -2130,7 +2248,7 @@ mod tests {
     fn too_long_reads_get_no_pairs() {
         let refs = vec![rec("refA", None, "ACGTACGTAC")];
         let batch = vec![rec("short", None, "ACGTAC"), rec("long", None, "ACGTACGTACGTACGT")];
-        let p = prepare_batch(batch, &refs, &[], false, 0, 0.5, true, 10);
+        let p = prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 10);
         assert_eq!(p.too_long, vec![false, true]);
         assert_eq!(p.pair_query_idx.len(), 2); // the short read only, both orientations
         assert!(p.pair_query_idx.iter().all(|&q| q == 0));
@@ -2141,12 +2259,12 @@ mod tests {
     #[test]
     fn kmer_filter_rejects_unrelated_pairs() {
         let refs = vec![rec("refA", None, "ACGTACGTACGTACGT")];
-        let ref_sets: Vec<HashSet<u64>> = refs.iter().map(|r| collect_kmers_packed(&r.seq, 4)).collect();
+        let index = KmerIndex::build(&refs, 4);
         let batch = vec![
             rec("same", None, "ACGTACGTACGTACGT"),
             rec("polyT", None, "TTTTTTTTTTTTTTTT"),
         ];
-        let p = prepare_batch(batch, &refs, &ref_sets, true, 4, 0.5, true, 500);
+        let p = prepare_batch(batch, &refs, &index, true, 4, 0.5, true, 500);
         assert!(p.fwd_kmer_pass[0]);
         assert!(!p.fwd_kmer_pass[1]);
         assert!(!p.rc_kmer_pass[1]); // RC of polyT is polyA: still no shared 4-mers
@@ -2173,13 +2291,74 @@ mod tests {
 
     #[test]
     fn kmer_fraction_threshold() {
-        let r = collect_kmers_packed(b"ACGTACGT", 4);
-        let same = collect_kmers_packed(b"ACGTACGT", 4);
-        let half = collect_kmers_packed(b"ACGTTTTT", 4); // ACGT shared, CGTT GTTT TTTT not
-        assert!(kmer_fraction_passes(&same, &r, 0.99));
-        assert!(kmer_fraction_passes(&half, &r, 0.25));
-        assert!(!kmer_fraction_passes(&half, &r, 0.5));
-        assert!(kmer_fraction_passes(&HashSet::new(), &r, 1.0)); // no k-mers: pass
+        assert!(kmer_fraction_passes(4, 4, 0.99));
+        assert!(kmer_fraction_passes(1, 4, 0.25));
+        assert!(!kmer_fraction_passes(1, 4, 0.5));
+        assert!(kmer_fraction_passes(0, 0, 1.0)); // no k-mers: pass
+    }
+
+    #[test]
+    fn kmer_index_lists_are_sorted_and_count_shared_kmers() {
+        let refs = vec![
+            rec("r0", None, "ACGTACGT"),   // 4-mers: ACGT CGTA GTAC TACG
+            rec("r1", None, "ACGTTTTT"),   // 4-mers: ACGT CGTT GTTT TTTT
+            rec("r2", None, "GGGG"),       // 4-mers: GGGG
+        ];
+        let index = KmerIndex::build(&refs, 4);
+        assert_eq!(index.len(), 8);
+        let acgt = collect_kmers_packed(b"ACGT", 4).into_iter().next().unwrap();
+        assert_eq!(index.refs_by_kmer[&acgt], vec![0, 1]);
+
+        let mut shared = vec![0u32; 3];
+        index.count_shared(&collect_kmers_packed(b"ACGTTTTT", 4), &mut shared);
+        assert_eq!(shared, vec![1, 4, 0]); // r0 shares ACGT only; r1 all four; r2 none
+        index.count_shared(&collect_kmers_packed(b"NNNN", 4), &mut shared);
+        assert_eq!(shared, vec![0, 0, 0]);
+    }
+
+    /// Tiny deterministic generator so the test needs no extra dependency.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn kmer_index_matches_per_reference_sets() {
+        // Random references; reads are mutated copies of references (so they
+        // share many k-mers) with occasional ambiguous bases. The index must give
+        // exactly the counts obtained by probing each reference's own k-mer set.
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let bases = b"ACGT";
+        let refs: Vec<SequenceRecord> = (0..40)
+            .map(|i| {
+                let seq: Vec<u8> = (0..(30 + i * 3)).map(|_| bases[(rng.next() % 4) as usize]).collect();
+                rec(&format!("r{}", i), None, std::str::from_utf8(&seq).unwrap())
+            })
+            .collect();
+        for k in [3usize, 8, 15] {
+            let index = KmerIndex::build(&refs, k);
+            let sets: Vec<HashSet<u64>> = refs.iter().map(|r| collect_kmers_packed(&r.seq, k)).collect();
+            let mut shared = vec![0u32; refs.len()];
+            for _ in 0..300 {
+                let src = &refs[(rng.next() % refs.len() as u64) as usize].seq;
+                let read: Vec<u8> = src.iter().map(|&b| match rng.next() % 12 {
+                    0 => bases[(rng.next() % 4) as usize],
+                    1 => b'N',
+                    _ => b,
+                }).collect();
+                let kmers = collect_kmers_packed(&read, k);
+                index.count_shared(&kmers, &mut shared);
+                for (ri, set) in sets.iter().enumerate() {
+                    let expected = kmers.iter().filter(|km| set.contains(km)).count();
+                    assert_eq!(shared[ri] as usize, expected, "k={} ref={}", k, ri);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2217,8 +2396,8 @@ mod tests {
         ];
         let tags = vec!["RG:Z:".to_string()];
 
-        let with = fake_gpu_result(prepare_batch(batch.clone(), &refs, &[], false, 0, 0.5, true, 500), 7, &[]);
-        let without = fake_gpu_result(prepare_batch(batch, &refs, &[], false, 0, 0.5, false, 500), 7, &[]);
+        let with = fake_gpu_result(prepare_batch(batch.clone(), &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 7, &[]);
+        let without = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, false, 500), 7, &[]);
         let a = format_batch_rows(&with, &refs, &tags, 2, 1, 4, 0, false, false);
         let b = format_batch_rows(&without, &refs, &tags, 2, 1, 4, 0, false, false);
 
@@ -2242,7 +2421,7 @@ mod tests {
             rec("r3", Some("RG:Z:c1"), "TTTTGGGGCC"),
         ];
         let tags = vec!["RG:Z:".to_string()];
-        let res = fake_gpu_result(prepare_batch(batch, &refs, &[], false, 0, 0.5, true, 500), 7, &[]);
+        let res = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 7, &[]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, true);
 
         assert_eq!(out.rows.len(), 6); // 3 groups x 2 refs
@@ -2255,6 +2434,58 @@ mod tests {
     }
 
     #[test]
+    fn collapse_keeps_unmerged_mates_together() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC")];
+        // Two identical unmerged pairs (mates share a name, written consecutively)
+        // from one cell, then a merged read whose sequence equals the first mate.
+        let batch = vec![
+            rec("p1", Some("RG:Z:c1"), "ACGTACGTAC"), rec("p1", Some("RG:Z:c1"), "TTTTGGGGCC"),
+            rec("p2", Some("RG:Z:c1"), "ACGTACGTAC"), rec("p2", Some("RG:Z:c1"), "TTTTGGGGCC"),
+            rec("m1", Some("RG:Z:c1"), "ACGTACGTAC"),
+            // same pair but a different cell: separate group
+            rec("p3", Some("RG:Z:c2"), "ACGTACGTAC"), rec("p3", Some("RG:Z:c2"), "TTTTGGGGCC"),
+        ];
+        let tags = vec!["RG:Z:".to_string()];
+        let res = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 7, &[]);
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, true);
+        assert_eq!(out.rows, vec![
+            vec!["p1", "refA", "10=", "+", "c1", "2"],
+            vec!["p1", "refA", "10=", "+", "c1", "2"],
+            vec!["m1", "refA", "10=", "+", "c1", "1"],
+            vec!["p3", "refA", "10=", "+", "c2", "1"],
+            vec!["p3", "refA", "10=", "+", "c2", "1"],
+        ]);
+        // n_reads summed over member rows equals the number of input records
+        let total: usize = out.rows.iter().map(|r| r[5].parse::<usize>().unwrap()).sum();
+        assert_eq!(total, 7);
+    }
+
+    #[test]
+    fn reader_keeps_same_name_records_in_one_batch() {
+        let fq = "@a RG:Z:c1\nACGT\n+\nIIII\n@a RG:Z:c1\nGGGG\n+\nIIII\n@b\ntttt\n+\nIIII\n@c\nCCCC\n+\nIIII\n@c\nAAAA\n+\nIIII\n";
+        let ids = |b: &[SequenceRecord]| b.iter().map(|x| x.id.clone()).collect::<Vec<_>>();
+        let mut r = FastqBatchReader::new(Box::new(std::io::Cursor::new(fq.as_bytes().to_vec())));
+        let b1 = r.read_batch(1).unwrap();
+        assert_eq!(ids(&b1), vec!["a", "a"]);
+        let b2 = r.read_batch(1).unwrap();
+        assert_eq!(ids(&b2), vec!["b"]);
+        assert_eq!(b2[0].seq, b"TTTT".to_vec()); // uppercased on load
+        let b3 = r.read_batch(1).unwrap();
+        assert_eq!(ids(&b3), vec!["c", "c"]);
+        assert!(r.read_batch(1).unwrap().is_empty());
+
+        // A batch size larger than the file returns everything at once.
+        let mut r = FastqBatchReader::new(Box::new(std::io::Cursor::new(fq.as_bytes().to_vec())));
+        assert_eq!(r.read_batch(100).unwrap().len(), 5);
+        assert!(r.read_batch(100).unwrap().is_empty());
+
+        let fa = ">x d1\nACGT\n>x d2\nGGGG\n>y\nTT\n";
+        let mut r = FastaBatchReader::new(Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())));
+        assert_eq!(ids(&r.read_batch(1).unwrap()), vec!["x", "x"]);
+        assert_eq!(ids(&r.read_batch(1).unwrap()), vec!["y"]);
+    }
+
+    #[test]
     fn cpu_fallback_uses_real_scores_to_pick_strand() {
         // One unique sequence vs one reference; the forward GPU result "fails"
         // (score -1) so the CPU re-aligns it. The RC result is a fabricated
@@ -2263,7 +2494,7 @@ mod tests {
         let tags: Vec<String> = Vec::new();
 
         // Case 1: the sequence equals the reference, CPU forward score 0 beats RC 7.
-        let p = prepare_batch(vec![rec("r0", None, "ACGTACGTAC")], &refs, &[], false, 0, 0.5, true, 500);
+        let p = prepare_batch(vec![rec("r0", None, "ACGTACGTAC")], &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500);
         let fwd_idx = p.fwd_gpu_idx[0].unwrap();
         let res = fake_gpu_result(p, 7, &[fwd_idx]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
@@ -2271,7 +2502,7 @@ mod tests {
         assert_eq!(out.cpu_fallbacks, 1);
 
         // Case 2: the sequence is unrelated, CPU forward score is high, RC 7 wins.
-        let p = prepare_batch(vec![rec("r0", None, "TTTTGGGGCC")], &refs, &[], false, 0, 0.5, true, 500);
+        let p = prepare_batch(vec![rec("r0", None, "TTTTGGGGCC")], &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500);
         let fwd_idx = p.fwd_gpu_idx[0].unwrap();
         let res = fake_gpu_result(p, 7, &[fwd_idx]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
@@ -2282,12 +2513,12 @@ mod tests {
     #[test]
     fn too_long_and_failed_rows() {
         let refs = vec![rec("refA", None, "ACGTACGTAC")];
-        let ref_sets: Vec<HashSet<u64>> = refs.iter().map(|r| collect_kmers_packed(&r.seq, 4)).collect();
+        let index = KmerIndex::build(&refs, 4);
         let batch = vec![
-            rec("long", None, "ACGTACGTACGTACGTACGT"),
+            rec("long", None, "ACGTACGTACGTACGT ACGT".replace(' ', "").as_str()),
             rec("polyT", None, "TTTTTTTTTT"),
         ];
-        let p = prepare_batch(batch, &refs, &ref_sets, true, 4, 0.5, true, 12);
+        let p = prepare_batch(batch, &refs, &index, true, 4, 0.5, true, 12);
         let res = fake_gpu_result(p, 7, &[]);
         let tags: Vec<String> = Vec::new();
 

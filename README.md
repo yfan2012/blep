@@ -14,7 +14,7 @@ The code in this repo was written by an AI assistant (claude opus) under guidanc
 - **Read deduplication** — identical read sequences within a batch are aligned once and the result is fanned back out to every read, so PCR-duplicate-heavy amplicon data aligns many times faster with byte-identical output. `--collapse` optionally emits one row per (sequence, header-tag values) group with an `n_reads` count instead
 - **Affine gap penalties** — configurable mismatch, gap-open, and gap-extension costs
 - **FASTA & FASTQ input** — auto-detected format, with transparent gzip/bzip2/xz decompression via [niffler](https://crates.io/crates/niffler)
-- **K-mer pre-filter** — optional k-mer overlap check (k ≤ 32, 2-bit packed) skips unlikely alignments before they reach the GPU, saving compute (applied independently to both orientations)
+- **K-mer pre-filter** — optional k-mer overlap check (k ≤ 32, 2-bit packed, inverted index over the references) skips unlikely alignments before they reach the GPU, saving compute (applied independently to both orientations); its cost per read does not grow with panel size
 - **Fully pipelined, multi-stage architecture** — disk reading, batch preparation (deduplication, reverse-complement, packing, k-mer filtering), GPU alignment, CPU fallback + output formatting, and TSV writing each run on their own thread(s) connected by bounded queues, so a GPU never blocks on CPU work or I/O. Preparation and post-processing are parallelized across CPU cores (tunable via `--prep-threads` / `--post-threads`) to keep every GPU fed. A per-stage timing summary (at `-v`) reports whether the GPUs are starving, blocked, or fully busy.
 - **Automatic GPU memory management** — queries available VRAM and splits work into sub-batches to avoid out-of-memory errors
 - **CPU fallback** — pairs that exceed the GPU score budget are transparently re-aligned on the CPU
@@ -105,7 +105,7 @@ read_name    reference_name    cigar    strand    [tag_values...]    [n_reads]
 
 - **cigar** — Extended CIGAR string (`=` match, `X` mismatch, `I` insertion, `D` deletion), or `FAILED` if the k-mer pre-filter rejected the pair in both orientations, or `*` if alignment could not be computed (including reads longer than `--max-read-length`).
 - **strand** — `+` if the best alignment is on the forward strand, `-` if the reverse complement produced a better score, or `.` if the pair was filtered/failed.
-- **n_reads** — only with `--collapse`: the number of reads (same sequence, same tag values) the row stands for. It is always the last column, so positional parsers of the earlier columns keep working.
+- **n_reads** — only with `--collapse`: the number of reads (same sequence, same tag values) the row stands for, or the number of read pairs for unmerged mates that share a name. It is always the last column, so positional parsers of the earlier columns keep working.
 
 By default there is one row per read × reference, and all rows for a read are contiguous.
 
@@ -203,7 +203,9 @@ Alignment depends only on a read's sequence, never on its name, quality string o
 
 Deduplication is per batch, so larger `--batch-size` values collapse more duplicates. The per-batch log line (`-v`) reports the ratio, e.g. `aligning batch of 10000 reads (2314 unique, 4.3x)`, and the final summary reports the overall ratio.
 
-With `--collapse`, blep writes one row per (sequence, header-tag values) group instead of one row per read. The group key includes the tag values, so the same amplicon sequence seen in two cells (`--header-tag RG:Z:`) stays two rows. `read_name` is the first read of the group and a trailing `n_reads` column gives the group size. Groups are formed within a batch, so a (sequence, tags) combination that spans batches appears on several rows; downstream code should sum `n_reads` rather than count rows. The missionbio `count_cigars_per_cell.py` does this automatically when it sees an `n_reads` header column; `extract_unaligned.py` needs per-read output.
+With `--collapse`, blep writes one row per group instead of one row per read. The group key includes the tag values, so the same amplicon sequence seen in two cells (`--header-tag RG:Z:`) stays two rows. `read_name` is the first read of the group and a trailing `n_reads` column gives the group size. Groups are formed within a batch, so a (sequence, tags) combination that spans batches appears on several rows; downstream code should sum `n_reads` rather than count rows. The missionbio `count_cigars_per_cell.py` does this automatically when it sees an `n_reads` header column; `extract_unaligned.py` needs per-read output.
+
+Collapsing is mate-aware. fastp (with `--include_unmerged`) writes the two mates of an unmerged pair as consecutive records with the same name, and downstream code pairs them back up by that name. blep treats consecutive same-name records as one template: the reader never splits them across a batch boundary, and in collapsed mode a template is keyed by the ordered list of its members' (sequence, tag values). Identical pairs from the same cell collapse into one group, every member still gets its own rows, all under the group's shared `read_name`, and `n_reads` counts templates (pairs, for mates). Per-cell counts from collapsed output therefore match those from per-read output exactly.
 
 ### Input normalization and length limits
 
@@ -211,6 +213,10 @@ With `--collapse`, blep writes one row per (sequence, header-tag values) group i
 - Reads longer than `--max-read-length` are not aligned (the GPU workspace is sized from that limit). They are reported with cigar `*` and strand `.` against every reference, and a warning at the end gives their count and the longest read seen, so the limit can be raised and the run repeated.
 - A reference longer than `--max-ref-length` is an error at startup.
 - `--kmer-length` must be between 1 and 32. K-mers are 2-bit packed; windows containing a non-ACGT base (e.g. `N`) are ignored, and a read with no valid k-mers passes the filter.
+
+### K-mer pre-filter
+
+For each read × reference pair, the filter asks what fraction of the read's distinct k-mers occur in the reference and aligns the pair only if that fraction reaches `--kmer-threshold`. The references are indexed once at startup as an inverted index: a map from every k-mer that occurs in any reference to the list of references containing it. Filtering a read then costs one lookup per read k-mer, after which the shared count for every reference is known, rather than one lookup per read k-mer per reference. On a 506-amplicon panel that is roughly 240 lookups per read instead of 120,000, with identical pass/fail decisions. The index for a panel of a few hundred amplicons holds on the order of 100,000 k-mers.
 
 ### CUDA kernel
 
