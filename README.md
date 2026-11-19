@@ -233,6 +233,8 @@ where `num_diags = 2 × max_k + 1` and `max_k = max(max_read_length, max_ref_len
 
 Backtrack entries are bit-packed into a single 32-bit integer: 2 bits for the operation, 2 bits for the source component, 12 bits for the previous score, and 16 bits for the previous diagonal index.
 
+Only the M wavefront has a backtrack table. The trace keeps track of which component (M, I or D) it is in: while it is following a gap through I or D cells it does not consult `bt_m`, which describes the M cell at that score and diagonal and usually a different path, but re-derives the gap cell's source from the wavefronts (gap open from M at `s − open − extend`, otherwise extension at `s − extend`). This costs no extra memory.
+
 The workspace is allocated once per GPU worker (sized for the largest sub-batch that fits in 75% of free VRAM) and reused across sub-batches. The kernel initialises wavefront rows lazily: row *s* is reset to EMPTY at the start of score iteration *s*, so a pair that aligns with score *S* touches *S*+1 rows rather than the whole `max_score+1`-row workspace, and stale contents from earlier launches are never read. Loops over a row are restricted to the band of diagonals reachable at that score (|*k*| ≤ *s* / `gap_extend`, since every k-changing transition costs at least `gap_extend`); cells outside the band are EMPTY by construction, so results are identical to scanning every diagonal.
 
 The kernel is compiled to PTX by `nvcc` at build time (via [`build.rs`](build.rs)) and embedded into the Rust binary using `include_str!`. At runtime it is loaded through [cudarc](https://crates.io/crates/cudarc).
@@ -247,16 +249,23 @@ If a pair's alignment score exceeds `--max-score` on the GPU (the kernel returns
 
 The CPU aligner is a direct port of the kernel (same wavefront layout, lazily allocated rows, banded loops, same backtrack rules), so it produces the same CIGARs; it gives up at score 4096, in which case the pair is reported as `*`. It returns the alignment score, which is used when choosing between the forward and reverse-complement orientations, so a pair whose orientations both exceeded the GPU budget is still assigned the better strand.
 
+### CIGAR consistency check
+
+No alignment is written unchecked. Before a result is accepted, blep verifies that its operations consume exactly the reference length and the read length, and that their gap-affine cost equals the score the aligner reported (`ops_are_consistent` in [`src/main.rs`](src/main.rs)). The cost test matters as much as the span test: a trace that follows the wrong path can still have the right spans. A GPU result that fails is re-aligned on the CPU; a CPU result that fails is reported as `*`. Failures are counted and reported in a warning at the end of the run. The count is expected to be zero, so that warning means a bug in the aligner.
+
 ### Testing
 
-`cargo test` runs CPU-only unit tests (deduplication and fan-out, collapsed output, k-mer packing, the CPU aligner); no GPU is needed. `./test.sh` runs the release binary end to end on the toy data in [`test_data/`](test_data/) and checks that deduplicated, `--no-dedup` and `--collapse` runs agree; it needs a CUDA GPU.
+`cargo test` runs CPU-only unit tests (deduplication and fan-out, collapsed output, k-mer packing, the CPU aligner); no GPU is needed. The CPU aligner is refereed by an independent Gotoh dynamic-programming aligner in the test module: on seeded random pairs its score must be the optimum and its CIGAR a true alignment (every `=` a match, every `X` a mismatch, both sequences consumed) costing exactly that score. `./test.sh` runs the release binary end to end on the toy data in [`test_data/`](test_data/) and checks that deduplicated, `--no-dedup` and `--collapse` runs agree and that every CIGAR spans its reference and its read; it needs a CUDA GPU.
 
-[`tools/kernel_emulate.cpp`](tools/kernel_emulate.cpp) compiles the CUDA kernel as ordinary host C++ and runs it on random read/reference pairs, so kernel changes can be checked for identical output against a previous version, and the Rust CPU aligner can be cross-checked against the kernel, without a GPU:
+[`tools/kernel_emulate.cpp`](tools/kernel_emulate.cpp) compiles the CUDA kernel as ordinary host C++ and runs it on random read/reference pairs, or on pairs read from a file, so kernel changes can be checked for identical output against a previous version, and the Rust CPU aligner can be cross-checked against the kernel, without a GPU. The cross-check also holds every kernel CIGAR to the same standard as the CPU aligner's (a true alignment at the optimal score):
 
 ```bash
 g++ -O2 -std=c++17 -I. -DKERNEL_FILE='"cuda/wfa_kernel.cu"' -o emu tools/kernel_emulate.cpp
 ./emu 1 4000 2 1 4 60 40 127 > emu.tsv          # seed trials gap_open gap_extend mismatch max_score max_len fill_byte
 BLEP_KERNEL_EMULATION_TSV=$PWD/emu.tsv cargo test cpu_align_matches_kernel_emulation
+
+# real reads: one "query<TAB>ref" pair per line ("-" for stdin)
+./emu --pairs pairs.tsv 5 1 3 300 300 127 > emu.tsv
 ```
 
 ### Dependencies

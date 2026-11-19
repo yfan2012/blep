@@ -74,7 +74,26 @@ N=$(awk -F'\t' 'NR>1 && $1=="r01" && $2=="ampA"{print $NF}' "$OUT/collapse.tsv")
 CSTR=$(awk -F'\t' 'NR>1 && $1=="r10" && $2=="ampA"{print $4 $NF}' "$OUT/collapse.tsv" | sort | tr -d '\n')
 [ "$CSTR" = "+1-1" ] && pass "collapsed r10 keeps both mates under one name (n_reads=1 each)" || fail "collapsed r10 rows: $CSTR"
 
-# 10. Per-cell counts must agree between per-read and collapsed output (needs the missionbio script).
+# 10. Every CIGAR accounts for exactly its reference and its read. Reference span = all ops
+#     but I, read span = all ops but D. Per-read rows are matched to their read by name; an
+#     unmerged pair shares one name, so a row passes if it fits either mate.
+BAD=$(awk -F'\t' '
+    FILENAME==ARGV[1] { if ($0 ~ /^>/) { split($0, h, /[ \t]/); id=substr(h[1],2) } else { reflen[id]+=length($0) } next }
+    FILENAME==ARGV[2] { if (FNR%4==1) { split($0, h, /[ \t]/); id=substr(h[1],2) } else if (FNR%4==2) { readlen[id]=readlen[id] " " length($0) } next }
+    FNR>1 && $3!="*" && $3!="FAILED" {
+        cig=$3; r=0; q=0
+        while (match(cig, /^[0-9]+[=XID]/)) {
+            n=substr(cig,1,RLENGTH-1)+0; op=substr(cig,RLENGTH,1)
+            if (op!="I") r+=n
+            if (op!="D") q+=n
+            cig=substr(cig,RLENGTH+1)
+        }
+        ok = (cig=="" && r==reflen[$2] && index(readlen[$1] " ", " " q " ")>0)
+        if (!ok) print $1, $2, $3, "ref " r "/" reflen[$2], "read " q "/" readlen[$1]
+    }' "$REFS" "$READS" "$OUT/dedup.tsv")
+if [ -z "$BAD" ]; then pass "every CIGAR spans its reference and its read"; else fail "CIGARs with a wrong span:"; echo "$BAD" | head; fi
+
+# 11. Per-cell counts must agree between per-read and collapsed output (needs the missionbio script).
 COUNT=$HOME/Code/missionbio/scripts/count_cigars_per_cell.py
 if [ -f "$COUNT" ]; then
     python3 "$COUNT" -i "$OUT/dedup.tsv"    -o "$OUT/dedup.cells.txt"    2> /dev/null

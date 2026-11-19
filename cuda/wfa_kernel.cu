@@ -342,69 +342,110 @@ extern "C" __global__ void wfa_align_kernel(
     }
 
     // --- Backtrack to reconstruct CIGAR ---
-    // Build operations in reverse, then reverse them
+    // Build operations in reverse, then reverse them.
+    //
+    // The trace has to know which wavefront component it is standing in.
+    // bt_m only describes how an M cell was reached. When that entry says the
+    // gap was *extended* from an I or D cell, the next step must follow that
+    // I/D cell's own source, not bt_m at the same (score, k): the M cell there
+    // holds the furthest offset of any path, usually a different one. An I/D
+    // cell needs no stored entry; its source is re-derived from the forward
+    // recurrence (gap open from M at s - o - e, else extension at s - e).
     char ops_buf[4096]; // Local buffer for operations (reverse order)
     int ops_count = 0;
+    int bt_ok = 1;
 
     int cur_s = final_score;
     int cur_k = target_k;
+    int cur_comp = COMP_M;
     int cur_off = wf_m[cur_s * D + (cur_k + max_k)];
 
-    while (cur_s > 0 && ops_count < 4095) {
-        int packed = bt_m[cur_s * D + (cur_k + max_k)];
-        if (packed == EMPTY) {
-            // No backtrack - fill remaining with matches
-            while (cur_off > 0 && ops_count < 4095) {
-                ops_buf[ops_count++] = OP_MATCH;
-                cur_off--;
+    while ((cur_s > 0 || cur_comp != COMP_M) && ops_count < 4095) {
+        if (cur_comp == COMP_M) {
+            int packed = bt_m[cur_s * D + (cur_k + max_k)];
+            // Every populated M cell above score 0 has an entry.
+            if (packed == EMPTY) { bt_ok = 0; break; }
+
+            int op, src_comp, prev_s, prev_k;
+            unpack_bt(packed, &op, &src_comp, &prev_s, &prev_k, max_k);
+
+            // Get previous offset
+            int prev_off;
+            if (src_comp == COMP_M) {
+                prev_off = wf_m[prev_s * D + (prev_k + max_k)];
+            } else if (src_comp == COMP_I) {
+                prev_off = wf_i[prev_s * D + (prev_k + max_k)];
+            } else {
+                prev_off = wf_d[prev_s * D + (prev_k + max_k)];
             }
-            break;
-        }
+            if (prev_off == EMPTY) { bt_ok = 0; break; }
 
-        int op, src_comp, prev_s, prev_k;
-        unpack_bt(packed, &op, &src_comp, &prev_s, &prev_k, max_k);
+            // Offset after the operation (before extend)
+            int off_after_op;
+            if (op == OP_MISMATCH) {
+                off_after_op = prev_off + 1;
+            } else if (op == OP_INSERTION) {
+                off_after_op = prev_off; // ref doesn't advance
+            } else if (op == OP_DELETION) {
+                off_after_op = prev_off + 1; // ref advances
+            } else {
+                off_after_op = prev_off;
+            }
 
-        // Get previous offset
-        int prev_off;
-        if (src_comp == COMP_M) {
-            prev_off = wf_m[prev_s * D + (prev_k + max_k)];
-        } else if (src_comp == COMP_I) {
-            prev_off = wf_i[prev_s * D + (prev_k + max_k)];
+            // Matches from extend. Never negative on a consistent trace.
+            int num_matches = cur_off - off_after_op;
+            if (num_matches < 0) { bt_ok = 0; break; }
+            for (int i = 0; i < num_matches && ops_count < 4095; i++) {
+                ops_buf[ops_count++] = OP_MATCH;
+            }
+
+            // The operation itself
+            if (ops_count < 4095) {
+                ops_buf[ops_count++] = (char)op;
+            }
+
+            cur_s = prev_s;
+            cur_k = prev_k;
+            cur_off = prev_off;
+            cur_comp = src_comp;
         } else {
-            prev_off = wf_d[prev_s * D + (prev_k + max_k)];
-        }
-        if (prev_off == EMPTY) prev_off = 0;
+            // In a gap component. I/D cells are never extended, so this step
+            // emits exactly one gap base and no matches.
+            int is_del = (cur_comp == COMP_D);
+            int prev_k = is_del ? cur_k + 1 : cur_k - 1;   // D: k - 1 <- k ; I: k + 1 <- k
+            int prev_ki = prev_k + max_k;
+            int prev_off = is_del ? cur_off - 1 : cur_off; // D advances the reference, I does not
+            int open_s = cur_s - gap_open - gap_extend;
+            int ext_s = cur_s - gap_extend;
+            const int* wf_gap = is_del ? wf_d : wf_i;
+            if (prev_ki < 0 || prev_ki >= (int)D || prev_off < 0) { bt_ok = 0; break; }
 
-        // Offset after the operation (before extend)
-        int off_after_op;
-        if (op == OP_MISMATCH) {
-            off_after_op = prev_off + 1;
-        } else if (op == OP_INSERTION) {
-            off_after_op = prev_off; // ref doesn't advance
-        } else if (op == OP_DELETION) {
-            off_after_op = prev_off + 1; // ref advances
-        } else {
-            off_after_op = prev_off;
-        }
+            int next_s, next_comp;
+            if (open_s >= 0 && wf_m[open_s * D + prev_ki] == prev_off) {
+                next_s = open_s;  next_comp = COMP_M;        // gap opened from M
+            } else if (ext_s >= 0 && wf_gap[ext_s * D + prev_ki] == prev_off) {
+                next_s = ext_s;   next_comp = cur_comp;      // gap extended
+            } else {
+                bt_ok = 0; break;
+            }
 
-        // Matches from extend
-        int num_matches = cur_off - off_after_op;
-        for (int i = 0; i < num_matches && ops_count < 4095; i++) {
-            ops_buf[ops_count++] = OP_MATCH;
+            ops_buf[ops_count++] = is_del ? OP_DELETION : OP_INSERTION;
+            cur_s = next_s;
+            cur_k = prev_k;
+            cur_off = prev_off;
+            cur_comp = next_comp;
         }
+    }
 
-        // The operation itself
-        if (ops_count < 4095) {
-            ops_buf[ops_count++] = (char)op;
-        }
-
-        cur_s = prev_s;
-        cur_k = prev_k;
-        cur_off = prev_off;
+    if (!bt_ok) {
+        // Inconsistent trace: never emit a guess. Hand the pair to the CPU.
+        out_scores[tid] = -1;
+        out_cigar_lengths[tid] = 0;
+        return;
     }
 
     // Handle remaining matches at score 0
-    if (cur_s == 0) {
+    if (cur_s == 0 && cur_comp == COMP_M) {
         while (cur_off > 0 && ops_count < 4095) {
             ops_buf[ops_count++] = OP_MATCH;
             cur_off--;
