@@ -646,6 +646,11 @@ fn main() -> Result<()> {
     if post_totals.cpu_fallbacks > 0 {
         info!("CPU fallback used for {} pairs total", post_totals.cpu_fallbacks);
     }
+    if post_totals.invalid_cigars > 0 {
+        warn!("{} alignments failed the cigar consistency check (wrong reference/read span, or a cost \
+               that differs from the alignment score) and were discarded. This is a bug in the aligner; \
+               please report it.", post_totals.invalid_cigars);
+    }
     if post_totals.too_long_reads > 0 {
         warn!("{} reads were longer than --max-read-length {} (longest: {} bp) and were reported with cigar '*'. \
                Raise --max-read-length to align them.",
@@ -756,6 +761,7 @@ impl StageStats {
 #[derive(Default, Clone)]
 struct PostTotals {
     cpu_fallbacks: usize,
+    invalid_cigars: usize,
     too_long_reads: usize,
     longest_read: usize,
 }
@@ -763,12 +769,14 @@ struct PostTotals {
 impl PostTotals {
     fn absorb(&mut self, outcome: &PostBatchOutcome) {
         self.cpu_fallbacks += outcome.cpu_fallbacks;
+        self.invalid_cigars += outcome.invalid_cigars;
         self.too_long_reads += outcome.too_long_reads;
         self.longest_read = self.longest_read.max(outcome.longest_read);
     }
 
     fn merge(&mut self, other: &PostTotals) {
         self.cpu_fallbacks += other.cpu_fallbacks;
+        self.invalid_cigars += other.invalid_cigars;
         self.too_long_reads += other.too_long_reads;
         self.longest_read = self.longest_read.max(other.longest_read);
     }
@@ -778,6 +786,8 @@ impl PostTotals {
 struct PostBatchOutcome {
     rows: Vec<Vec<String>>,
     cpu_fallbacks: usize,
+    /// Alignments (GPU or CPU) rejected by `ops_are_consistent`. Expected to be 0.
+    invalid_cigars: usize,
     too_long_reads: usize,
     longest_read: usize,
 }
@@ -1139,7 +1149,13 @@ fn run_gpu_alignment(
 /// Resolve one orientation of a (unique sequence, reference) pair: take the GPU
 /// result if the pair was aligned within the score budget, otherwise re-align on
 /// the CPU. `query` is only invoked when the CPU fallback is needed (so the
-/// reverse complement is not recomputed for pairs the GPU finished).
+/// reverse complement is not recomputed for pairs the GPU finished);
+/// `query_len` is its length, which is the same in both orientations.
+///
+/// Nothing is emitted unchecked: a result is accepted only if
+/// `ops_are_consistent` holds. A GPU result that fails is re-aligned on the
+/// CPU, and a CPU result that fails is dropped; both are counted in
+/// `invalid_cigars`, which should stay 0.
 /// Returns `(score, cigar)` or `None` if the orientation was filtered out or
 /// could not be aligned at all.
 fn resolve_orientation<'a, F>(
@@ -1147,12 +1163,14 @@ fn resolve_orientation<'a, F>(
     gpu_idx: Option<usize>,
     result: &GpuBatchResult,
     query: F,
+    query_len: usize,
     reference: &[u8],
     gap_open: i32,
     gap_extend: i32,
     mismatch: i32,
     max_k: usize,
     cpu_fallbacks: &mut usize,
+    invalid_cigars: &mut usize,
     label: &str,
     read_id: &str,
     ref_id: &str,
@@ -1168,12 +1186,24 @@ where
     let cigar_len = result.cigar_lengths[gpu_idx] as usize;
     if score >= 0 && cigar_len > 0 {
         let ops: Vec<u8> = result.cigar_ops[gpu_idx].iter().map(|&x| x as u8).collect();
-        return Some((score, ops_to_cigar(&ops)));
+        if ops_are_consistent(&ops, reference.len(), query_len, score, gap_open, gap_extend, mismatch) {
+            return Some((score, ops_to_cigar(&ops)));
+        }
+        *invalid_cigars += 1;
+        debug!("inconsistent GPU cigar ({}) for read {} vs ref {}: {} (score {})",
+               label, read_id, ref_id, ops_to_cigar(&ops), score);
     }
     *cpu_fallbacks += 1;
     debug!("CPU fallback ({}) for read {} vs ref {}", label, read_id, ref_id);
     let q = query();
-    cpu_align(&q, reference, gap_open, gap_extend, mismatch, max_k)
+    let (score, ops) = cpu_align_ops(&q, reference, gap_open, gap_extend, mismatch, max_k)?;
+    if !ops_are_consistent(&ops, reference.len(), q.len(), score, gap_open, gap_extend, mismatch) {
+        *invalid_cigars += 1;
+        debug!("inconsistent CPU cigar ({}) for read {} vs ref {}: {} (score {})",
+               label, read_id, ref_id, ops_to_cigar(&ops), score);
+        return None;
+    }
+    Some((score, ops_to_cigar(&ops)))
 }
 
 /// Append one output row for a resolved pair. `n_reads` is `Some` only in
@@ -1252,6 +1282,7 @@ fn format_batch_rows(
     let prepared = &result.prepared;
     let num_refs = prepared.num_refs;
     let mut cpu_fallbacks = 0usize;
+    let mut invalid_cigars = 0usize;
 
     // ---- Step 1: resolve each (unique sequence, reference) pair once ----
     let mut calls: Vec<PairCall> = Vec::with_capacity(prepared.num_unique * num_refs);
@@ -1277,14 +1308,14 @@ fn format_batch_rows(
 
             let fwd_result = resolve_orientation(
                 fwd_passed, prepared.fwd_gpu_idx[global_idx], result,
-                || Cow::Borrowed(seq), &references[ri].seq,
-                gap_open, gap_extend, mismatch, max_k, &mut cpu_fallbacks,
+                || Cow::Borrowed(seq), seq.len(), &references[ri].seq,
+                gap_open, gap_extend, mismatch, max_k, &mut cpu_fallbacks, &mut invalid_cigars,
                 "fwd", &rep.id, &references[ri].id,
             );
             let rc_result = resolve_orientation(
                 rc_passed, prepared.rc_gpu_idx[global_idx], result,
-                || Cow::Owned(reverse_complement(seq)), &references[ri].seq,
-                gap_open, gap_extend, mismatch, max_k, &mut cpu_fallbacks,
+                || Cow::Owned(reverse_complement(seq)), seq.len(), &references[ri].seq,
+                gap_open, gap_extend, mismatch, max_k, &mut cpu_fallbacks, &mut invalid_cigars,
                 "rc", &rep.id, &references[ri].id,
             );
 
@@ -1379,7 +1410,7 @@ fn format_batch_rows(
         }
     }
 
-    PostBatchOutcome { rows, cpu_fallbacks, too_long_reads, longest_read }
+    PostBatchOutcome { rows, cpu_fallbacks, invalid_cigars, too_long_reads, longest_read }
 }
 
 /// Launch the WFA alignment kernel for a set of pairs, handling sub-batching for
@@ -1551,6 +1582,45 @@ fn ops_to_cigar(ops: &[u8]) -> String {
     cigar
 }
 
+/// True when `ops` is a self-consistent record of a global alignment: it
+/// consumes exactly `ref_len` reference bases and `query_len` query bases, and
+/// its gap-affine cost (a gap of length L costs `gap_open + L * gap_extend`)
+/// equals `score`, the score the aligner reported for it.
+///
+/// The cost test matters as much as the span test: a backtrack that follows
+/// the wrong path can still produce ops with the right spans, and only the
+/// cost gives it away. Neither test needs the sequences, so this is cheap
+/// enough to run on every alignment before it is written.
+fn ops_are_consistent(
+    ops: &[u8],
+    ref_len: usize,
+    query_len: usize,
+    score: i32,
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+) -> bool {
+    let (mut ref_span, mut query_span, mut cost) = (0usize, 0usize, 0i64);
+    let mut prev = u8::MAX;
+    for &op in ops {
+        match op {
+            OP_MATCH => { ref_span += 1; query_span += 1; }
+            OP_MISMATCH => { ref_span += 1; query_span += 1; cost += mismatch as i64; }
+            OP_INSERTION => {
+                query_span += 1;
+                cost += gap_extend as i64 + if prev == OP_INSERTION { 0 } else { gap_open as i64 };
+            }
+            OP_DELETION => {
+                ref_span += 1;
+                cost += gap_extend as i64 + if prev == OP_DELETION { 0 } else { gap_open as i64 };
+            }
+            _ => return false,
+        }
+        prev = op;
+    }
+    ref_span == ref_len && query_span == query_len && cost == score as i64
+}
+
 fn op_to_char(op: u8) -> char {
     match op {
         OP_MATCH => '=',
@@ -1638,16 +1708,18 @@ impl CpuWavefronts {
 /// `workspace_max_k` is the kernel's `max_k` (`max(max_read_length,
 /// max_ref_length)`); using the same diagonal range makes the CPU result
 /// identical to what the GPU would compute. Pass 0 to size from the pair alone.
-/// Returns `(score, cigar)`, or `None` if no alignment is found within
-/// `CPU_MAX_SCORE`.
-fn cpu_align(
+/// Returns `(score, ops)` with one op per alignment column, or `None` if no
+/// alignment is found within `CPU_MAX_SCORE`. If the backtrack ever finds the
+/// wavefronts inconsistent it returns an empty op list, which
+/// `ops_are_consistent` rejects, rather than a guess.
+fn cpu_align_ops(
     query: &[u8],
     reference: &[u8],
     gap_open: i32,
     gap_extend: i32,
     mismatch: i32,
     workspace_max_k: usize,
-) -> Option<(i32, String)> {
+) -> Option<(i32, Vec<u8>)> {
     let n = query.len() as i32;
     let m = reference.len() as i32;
     let max_k = std::cmp::max(std::cmp::max(n, m), std::cmp::max(workspace_max_k as i32, 1));
@@ -1671,7 +1743,7 @@ fn cpu_align(
     let j0 = wf.idx(0, max_k);
     wf.m[j0] = extend(0, 0);
     if target_k == 0 && wf.m[j0] >= m {
-        return Some((0, format!("{}=", n)));
+        return Some((0, vec![OP_MATCH; n as usize]));
     }
 
     let mut final_score = -1i32;
@@ -1819,43 +1891,106 @@ fn cpu_align(
     }
 
     // --- Backtrack to reconstruct CIGAR (same rules as the kernel) ---
-    let mut ops: Vec<u8> = Vec::with_capacity((n + m) as usize);
+    // The trace has to know which wavefront component it is standing in.
+    // `wf.bt` only describes how an M cell was reached. When that entry says
+    // the gap was *extended* from an I or D cell, the next step must follow
+    // that I/D cell's own source, not `wf.bt` at the same (score, k): the M
+    // cell there holds the furthest offset of any path, usually a different
+    // one. An I/D cell needs no stored entry; its source is re-derived from
+    // the forward recurrence (gap open from M at s - o - e, else extension at
+    // s - e).
+    let max_ops = (n + m) as usize;
+    let mut ops: Vec<u8> = Vec::with_capacity(max_ops);
     let mut cur_s = final_score;
     let mut cur_k = target_k;
+    let mut cur_comp = COMP_M;
     let mut cur_off = wf.m[wf.idx(cur_s, cur_k + max_k)];
+    let mut consistent = true;
 
-    while cur_s > 0 {
-        let bt = wf.bt[wf.idx(cur_s, cur_k + max_k)];
-        if bt.op == BT_NONE {
-            // No backtrack - fill remaining with matches
-            while cur_off > 0 { ops.push(OP_MATCH); cur_off -= 1; }
+    while cur_s > 0 || cur_comp != COMP_M {
+        if ops.len() > max_ops {
+            consistent = false;
             break;
         }
-        let pj = wf.idx(bt.prev_s, bt.prev_k + max_k);
-        let mut prev_off = match bt.src {
-            COMP_M => wf.m[pj],
-            COMP_I => wf.i[pj],
-            _ => wf.d[pj],
-        };
-        if prev_off == WF_EMPTY { prev_off = 0; }
-        // Offset after the operation (before extend)
-        let off_after_op = match bt.op {
-            OP_MISMATCH | OP_DELETION => prev_off + 1,
-            _ => prev_off,
-        };
-        // Matches from extend, then the operation itself
-        for _ in 0..(cur_off - off_after_op).max(0) { ops.push(OP_MATCH); }
-        ops.push(bt.op);
-        cur_s = bt.prev_s;
-        cur_k = bt.prev_k;
-        cur_off = prev_off;
+        if cur_comp == COMP_M {
+            let bt = wf.bt[wf.idx(cur_s, cur_k + max_k)];
+            if bt.op == BT_NONE {
+                consistent = false;
+                break;
+            }
+            let pj = wf.idx(bt.prev_s, bt.prev_k + max_k);
+            let prev_off = match bt.src {
+                COMP_M => wf.m[pj],
+                COMP_I => wf.i[pj],
+                _ => wf.d[pj],
+            };
+            // Offset after the operation (before extend)
+            let off_after_op = match bt.op {
+                OP_MISMATCH | OP_DELETION => prev_off + 1,
+                _ => prev_off,
+            };
+            // Matches from extend (never negative on a consistent trace), then the operation itself
+            if prev_off == WF_EMPTY || cur_off < off_after_op {
+                consistent = false;
+                break;
+            }
+            for _ in 0..(cur_off - off_after_op) { ops.push(OP_MATCH); }
+            ops.push(bt.op);
+            cur_s = bt.prev_s;
+            cur_k = bt.prev_k;
+            cur_off = prev_off;
+            cur_comp = bt.src;
+        } else {
+            // In a gap component. I/D cells are never extended, so this step
+            // emits exactly one gap base and no matches.
+            let is_del = cur_comp == COMP_D;
+            let prev_k = if is_del { cur_k + 1 } else { cur_k - 1 };
+            let prev_ki = prev_k + max_k;
+            let prev_off = if is_del { cur_off - 1 } else { cur_off };
+            if prev_ki < 0 || prev_ki >= nd || prev_off < 0 {
+                consistent = false;
+                break;
+            }
+            let open_s = cur_s - gap_open - gap_extend;
+            let ext_s = cur_s - gap_extend;
+            let (next_s, next_comp) = if open_s >= 0 && wf.m[wf.idx(open_s, prev_ki)] == prev_off {
+                (open_s, COMP_M) // gap opened from M
+            } else if ext_s >= 0
+                && (if is_del { &wf.d } else { &wf.i })[wf.idx(ext_s, prev_ki)] == prev_off
+            {
+                (ext_s, cur_comp) // gap extended
+            } else {
+                consistent = false;
+                break;
+            };
+            ops.push(if is_del { OP_DELETION } else { OP_INSERTION });
+            cur_s = next_s;
+            cur_k = prev_k;
+            cur_off = prev_off;
+            cur_comp = next_comp;
+        }
+    }
+    if !consistent {
+        return Some((final_score, Vec::new()));
     }
     // Remaining matches at score 0
-    if cur_s == 0 {
-        while cur_off > 0 { ops.push(OP_MATCH); cur_off -= 1; }
-    }
+    while cur_off > 0 { ops.push(OP_MATCH); cur_off -= 1; }
     ops.reverse();
-    Some((final_score, ops_to_cigar(&ops)))
+    Some((final_score, ops))
+}
+
+/// `cpu_align_ops` with the ops rendered as a CIGAR string.
+#[cfg(test)]
+fn cpu_align(
+    query: &[u8],
+    reference: &[u8],
+    gap_open: i32,
+    gap_extend: i32,
+    mismatch: i32,
+    workspace_max_k: usize,
+) -> Option<(i32, String)> {
+    cpu_align_ops(query, reference, gap_open, gap_extend, mismatch, workspace_max_k)
+        .map(|(score, ops)| (score, ops_to_cigar(&ops)))
 }
 
 // ============================================================
@@ -2184,9 +2319,12 @@ mod tests {
     }
 
     /// Fabricate GPU results for a prepared batch: forward pairs align
-    /// perfectly (score 0, all matches), RC pairs are all mismatches (score
-    /// `rc_score`). Pairs listed in `gpu_failed` get score -1 (CPU fallback).
-    fn fake_gpu_result(prepared: PreparedBatch, rc_score: i32, gpu_failed: &[usize]) -> GpuBatchResult {
+    /// perfectly (score 0, all matches), RC pairs carry one mismatch (score
+    /// `mismatch`, the penalty the caller formats with). Both are consistent
+    /// records for a read as long as its reference, which is what
+    /// `ops_are_consistent` requires of anything the GPU returns. Pairs listed
+    /// in `gpu_failed` get score -1 (CPU fallback).
+    fn fake_gpu_result(prepared: PreparedBatch, mismatch: i32, gpu_failed: &[usize]) -> GpuBatchResult {
         let n = prepared.pair_query_idx.len();
         let mut scores = vec![0i32; n];
         let mut cigar_ops: Vec<Vec<i8>> = vec![Vec::new(); n];
@@ -2199,8 +2337,9 @@ mod tests {
                 continue;
             }
             if prepared.pair_is_rc[i] {
-                scores[i] = rc_score;
-                cigar_ops[i] = vec![OP_MISMATCH as i8; len];
+                scores[i] = mismatch;
+                cigar_ops[i] = vec![OP_MATCH as i8; len];
+                cigar_ops[i][0] = OP_MISMATCH as i8;
             } else {
                 scores[i] = 0;
                 cigar_ops[i] = vec![OP_MATCH as i8; len];
@@ -2396,8 +2535,8 @@ mod tests {
         ];
         let tags = vec!["RG:Z:".to_string()];
 
-        let with = fake_gpu_result(prepare_batch(batch.clone(), &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 7, &[]);
-        let without = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, false, 500), 7, &[]);
+        let with = fake_gpu_result(prepare_batch(batch.clone(), &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 4, &[]);
+        let without = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, false, 500), 4, &[]);
         let a = format_batch_rows(&with, &refs, &tags, 2, 1, 4, 0, false, false);
         let b = format_batch_rows(&without, &refs, &tags, 2, 1, 4, 0, false, false);
 
@@ -2408,6 +2547,7 @@ mod tests {
         assert_eq!(a.rows[4], vec!["r2", "refA", "10=", "+", "c2"]);
         assert_eq!(a.rows[6], vec!["r3", "refA", "10=", "+", "c1"]);
         assert_eq!(a.cpu_fallbacks, 0);
+        assert_eq!(a.invalid_cigars, 0);
         assert_eq!(a.too_long_reads, 0);
     }
 
@@ -2421,7 +2561,7 @@ mod tests {
             rec("r3", Some("RG:Z:c1"), "TTTTGGGGCC"),
         ];
         let tags = vec!["RG:Z:".to_string()];
-        let res = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 7, &[]);
+        let res = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 4, &[]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, true);
 
         assert_eq!(out.rows.len(), 6); // 3 groups x 2 refs
@@ -2446,7 +2586,7 @@ mod tests {
             rec("p3", Some("RG:Z:c2"), "ACGTACGTAC"), rec("p3", Some("RG:Z:c2"), "TTTTGGGGCC"),
         ];
         let tags = vec!["RG:Z:".to_string()];
-        let res = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 7, &[]);
+        let res = fake_gpu_result(prepare_batch(batch, &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500), 4, &[]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, true);
         assert_eq!(out.rows, vec![
             vec!["p1", "refA", "10=", "+", "c1", "2"],
@@ -2489,25 +2629,26 @@ mod tests {
     fn cpu_fallback_uses_real_scores_to_pick_strand() {
         // One unique sequence vs one reference; the forward GPU result "fails"
         // (score -1) so the CPU re-aligns it. The RC result is a fabricated
-        // all-mismatch alignment with score 7.
+        // one-mismatch alignment with score 4.
         let refs = vec![rec("refA", None, "ACGTACGTAC")];
         let tags: Vec<String> = Vec::new();
 
-        // Case 1: the sequence equals the reference, CPU forward score 0 beats RC 7.
+        // Case 1: the sequence equals the reference, CPU forward score 0 beats RC 4.
         let p = prepare_batch(vec![rec("r0", None, "ACGTACGTAC")], &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500);
         let fwd_idx = p.fwd_gpu_idx[0].unwrap();
-        let res = fake_gpu_result(p, 7, &[fwd_idx]);
+        let res = fake_gpu_result(p, 4, &[fwd_idx]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
         assert_eq!(out.rows, vec![vec!["r0", "refA", "10=", "+"]]);
         assert_eq!(out.cpu_fallbacks, 1);
 
-        // Case 2: the sequence is unrelated, CPU forward score is high, RC 7 wins.
+        // Case 2: the sequence is unrelated, CPU forward score is high, RC 4 wins.
         let p = prepare_batch(vec![rec("r0", None, "TTTTGGGGCC")], &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500);
         let fwd_idx = p.fwd_gpu_idx[0].unwrap();
-        let res = fake_gpu_result(p, 7, &[fwd_idx]);
+        let res = fake_gpu_result(p, 4, &[fwd_idx]);
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
-        assert_eq!(out.rows, vec![vec!["r0", "refA", "10X", "-"]]);
+        assert_eq!(out.rows, vec![vec!["r0", "refA", "1X9=", "-"]]);
         assert_eq!(out.cpu_fallbacks, 1);
+        assert_eq!(out.invalid_cigars, 0);
     }
 
     #[test]
@@ -2519,7 +2660,7 @@ mod tests {
             rec("polyT", None, "TTTTTTTTTT"),
         ];
         let p = prepare_batch(batch, &refs, &index, true, 4, 0.5, true, 12);
-        let res = fake_gpu_result(p, 7, &[]);
+        let res = fake_gpu_result(p, 4, &[]);
         let tags: Vec<String> = Vec::new();
 
         let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
@@ -2547,9 +2688,216 @@ mod tests {
         assert_eq!(dedup_ratio(0, 0), 1.0);
     }
 
+    /// Walk a CIGAR against the two sequences. Returns its gap-affine cost if
+    /// it is a true end-to-end alignment (every `=` a match, every `X` a
+    /// mismatch, both sequences consumed exactly), otherwise `None`.
+    fn true_alignment_cost(cigar: &str, q: &[u8], r: &[u8], go: i32, ge: i32, mm: i32) -> Option<i32> {
+        let (mut i, mut j, mut cost) = (0usize, 0usize, 0i32);
+        let (mut prev, mut run) = (' ', 0usize);
+        for c in cigar.chars() {
+            if let Some(d) = c.to_digit(10) {
+                run = run * 10 + d as usize;
+                continue;
+            }
+            for _ in 0..run {
+                match c {
+                    '=' | 'X' => {
+                        if i >= r.len() || j >= q.len() || (q[j] == r[i]) != (c == '=') { return None; }
+                        if c == 'X' { cost += mm; }
+                        i += 1;
+                        j += 1;
+                    }
+                    'D' => {
+                        if i >= r.len() { return None; }
+                        cost += ge + if prev == 'D' { 0 } else { go };
+                        i += 1;
+                    }
+                    'I' => {
+                        if j >= q.len() { return None; }
+                        cost += ge + if prev == 'I' { 0 } else { go };
+                        j += 1;
+                    }
+                    _ => return None,
+                }
+                prev = c;
+            }
+            run = 0;
+        }
+        (i == r.len() && j == q.len()).then_some(cost)
+    }
+
+    /// Optimal global gap-affine score by plain dynamic programming (Gotoh).
+    /// Shares nothing with the WFA code, so it can referee it.
+    fn gotoh_score(q: &[u8], r: &[u8], go: i32, ge: i32, mm: i32) -> i32 {
+        const INF: i32 = i32::MAX / 4;
+        let (n, m) = (q.len(), r.len());
+        // Row = query position, column = reference position.
+        let mut pm = vec![INF; m + 1];
+        let mut pi = vec![INF; m + 1];
+        let mut pd: Vec<i32> = (0..=m as i32).map(|c| go + c * ge).collect();
+        pm[0] = 0;
+        pd[0] = INF;
+        for row in 1..=n {
+            let (mut cm, mut ci, mut cd) = (vec![INF; m + 1], vec![INF; m + 1], vec![INF; m + 1]);
+            ci[0] = go + row as i32 * ge;
+            for c in 1..=m {
+                let sub = if q[row - 1] == r[c - 1] { 0 } else { mm };
+                cm[c] = pm[c - 1].min(pi[c - 1]).min(pd[c - 1]) + sub;
+                ci[c] = (pm[c].min(pd[c]) + go + ge).min(pi[c] + ge);
+                cd[c] = (cm[c - 1].min(ci[c - 1]) + go + ge).min(cd[c - 1] + ge);
+            }
+            (pm, pi, pd) = (cm, ci, cd);
+        }
+        pm[m].min(pi[m]).min(pd[m])
+    }
+
+    /// Assert that `cpu_align` returns the optimal score and a CIGAR that is a
+    /// true alignment costing exactly that score.
+    fn assert_optimal_true_alignment(q: &[u8], r: &[u8], go: i32, ge: i32, mm: i32) -> (i32, String) {
+        let (score, cigar) = cpu_align(q, r, go, ge, mm, 0).expect("pair aligns within CPU_MAX_SCORE");
+        let ctx = format!("{} vs {} at -g {} -e {} -m {}: {} (score {})",
+                          String::from_utf8_lossy(q), String::from_utf8_lossy(r), go, ge, mm, cigar, score);
+        assert_eq!(score, gotoh_score(q, r, go, ge, mm), "score is not optimal: {}", ctx);
+        assert_eq!(true_alignment_cost(&cigar, q, r, go, ge, mm), Some(score),
+                   "cigar is not a true alignment at the reported score: {}", ctx);
+        (score, cigar)
+    }
+
+    #[test]
+    fn test_referees_agree_with_known_answers() {
+        assert_eq!(gotoh_score(b"ACGT", b"ACGT", 5, 1, 3), 0);
+        assert_eq!(gotoh_score(b"ACGAACGT", b"ACGTACGT", 2, 1, 4), 4);
+        assert_eq!(gotoh_score(b"ACGTACG", b"ACGTTACG", 2, 1, 4), 3);
+        assert_eq!(true_alignment_cost("4=1D3=", b"ACGTACG", b"ACGTTACG", 2, 1, 4), Some(3));
+        assert_eq!(true_alignment_cost("3=1X4=", b"ACGAACGT", b"ACGTACGT", 2, 1, 4), Some(4));
+        // A '=' over a mismatch, a short span and a long span are all rejected.
+        assert_eq!(true_alignment_cost("8=", b"ACGAACGT", b"ACGTACGT", 2, 1, 4), None);
+        assert_eq!(true_alignment_cost("7=", b"ACGTACGT", b"ACGTACGT", 2, 1, 4), None);
+        assert_eq!(true_alignment_cost("9=", b"ACGTACGT", b"ACGTACGT", 2, 1, 4), None);
+    }
+
+    #[test]
+    fn ops_consistency_check() {
+        let ops = [OP_MATCH, OP_MATCH, OP_DELETION, OP_DELETION, OP_MISMATCH, OP_INSERTION];
+        // 5 reference bases, 4 query bases; cost = (5 + 2*1) + 3 + (5 + 1) = 16
+        assert!(ops_are_consistent(&ops, 5, 4, 16, 5, 1, 3));
+        assert!(!ops_are_consistent(&ops, 6, 4, 16, 5, 1, 3)); // reference span
+        assert!(!ops_are_consistent(&ops, 5, 5, 16, 5, 1, 3)); // query span
+        assert!(!ops_are_consistent(&ops, 5, 4, 11, 5, 1, 3)); // spans right, cost is not the score
+        assert!(!ops_are_consistent(&[OP_MATCH, 9], 2, 2, 0, 5, 1, 3)); // unknown op
+        assert!(!ops_are_consistent(&[], 5, 4, 0, 5, 1, 3));
+        // An insertion run followed by a deletion run opens two gaps.
+        assert!(ops_are_consistent(&[OP_INSERTION, OP_DELETION], 1, 1, 12, 5, 1, 3));
+    }
+
+    /// The backtrack must follow a gap through the I/D components. These are
+    /// the smallest pairs on which reading the M backtrack entry at a D cell
+    /// went wrong, one for each way it showed.
+    #[test]
+    fn backtrack_follows_gap_components() {
+        // Used to give 4X1D1X: 6 reference bases and 5 query bases for a 5/4 pair.
+        let (score, cigar) = assert_optimal_true_alignment(b"CATC", b"ATGAA", 5, 1, 3);
+        assert_eq!(score, 16);
+        assert_ne!(cigar, "4X1D1X");
+        // Used to give 1D1=1X1D: well-formed, but costing 15 against a score of 10.
+        let (score, cigar) = assert_optimal_true_alignment(b"GG", b"AGCT", 5, 1, 3);
+        assert_eq!(score, 10);
+        assert_ne!(cigar, "1D1=1X1D");
+        // The same defect through the insertion component (mirror image).
+        assert_optimal_true_alignment(b"ATGAA", b"CATC", 5, 1, 3);
+        assert_optimal_true_alignment(b"AGCT", b"GG", 5, 1, 3);
+        assert_optimal_true_alignment(b"CTT", b"AA", 2, 1, 4);
+    }
+
+    /// Mate 1 of read VH01313:70:AAGMYG2M5:1:1101:32717:4540 (EDITT_2615_14)
+    /// against the 208-base TRAC_PE amplicon. blep used to report
+    /// 4D95=44D2=9D3=1X2=10D1=1X3=1X1=3X1D1X4=1X3D4=16D1X for it, which spans
+    /// 211 reference and 124 query bases.
+    #[test]
+    fn real_read_cigar_spans_reference_and_read() {
+        let read = b"TTTCCCGTATAAAGCATGAGACCGTGACTTGCCAGCCCCACAGAGCCCCGCCCTTGTCCATCACTGGCATCTGGACTCCAGCCTGGGT\
+                     TGGGGCAAAGAGGGAAATGAGATCATGTCCTAA";
+        let trac_pe = b"GCTATTTCCCGTATAAAGCATGAGACCGTGACTTGCCAGCCCCACAGAGCCCCGCCCTTGTCCATCACTGGCATCTGGACTCCAGCC\
+                        TGGGTTGGGGCAGGTTTGTCTGGTCAACCACCGCGGTCTCAGTGGTGTACGGTACAAACCACCAGCTGAGAGACTCTAAATCCAGTG\
+                        ACAAGTCTGTCTGCCTATTCACCGATTTTGATTC";
+        assert_eq!((read.len(), trac_pe.len()), (121, 208));
+        let (score, cigar) = assert_optimal_true_alignment(read, trac_pe, 5, 1, 3);
+        assert_eq!(score, 139);
+        assert_ne!(cigar, "4D95=44D2=9D3=1X2=10D1=1X3=1X1=3X1D1X4=1X3D4=16D1X");
+        // The default penalties never showed the span error on this read; keep them honest too.
+        assert_optimal_true_alignment(read, trac_pe, 2, 1, 4);
+    }
+
+    /// The invariant, over a seeded corpus: whatever the pair and the
+    /// penalties, the score is the Gotoh optimum and the CIGAR is a true
+    /// alignment costing exactly that. Unrelated pairs and heavily edited
+    /// copies are both included, because the backtrack only went wrong where
+    /// several paths compete.
+    #[test]
+    fn cpu_align_is_optimal_and_true_on_random_pairs() {
+        let mut rng = XorShift(0x9E3779B97F4A7C15);
+        let mut below = |n: u64| (rng.next() % n) as usize;
+        let bases = b"ACGT";
+        for &(go, ge, mm) in &[(5, 1, 3), (2, 1, 4), (6, 2, 4), (1, 1, 1), (0, 1, 2)] {
+            for _ in 0..1500 {
+                let m = 1 + below(40);
+                let reference: Vec<u8> = (0..m).map(|_| bases[below(4)]).collect();
+                let query: Vec<u8> = if below(3) == 0 {
+                    let n = 1 + below(40);
+                    (0..n).map(|_| bases[below(4)]).collect()
+                } else {
+                    let mut q = reference.clone();
+                    for _ in 0..below(10) {
+                        let pos = below(q.len() as u64);
+                        match below(3) {
+                            0 => q[pos] = bases[below(4)],
+                            1 => for _ in 0..1 + below(6) { q.insert(pos, bases[below(4)]); },
+                            _ => for _ in 0..1 + below(6) { if q.len() > 1 && pos < q.len() { q.remove(pos); } },
+                        }
+                    }
+                    q
+                };
+                assert_optimal_true_alignment(&query, &reference, go, ge, mm);
+            }
+        }
+    }
+
+    /// A GPU result that is not a consistent record is never written: the pair
+    /// is re-aligned on the CPU and the rejection is counted.
+    #[test]
+    fn inconsistent_gpu_cigar_is_realigned_and_counted() {
+        let refs = vec![rec("refA", None, "ACGTACGTAC")];
+        let tags: Vec<String> = Vec::new();
+        let prepare = || prepare_batch(vec![rec("r0", None, "ACGTACGTAC")], &refs, &KmerIndex::build(&refs, 0), false, 0, 0.5, true, 500);
+
+        // Reference span too long by one (the shape of the old backtrack bug).
+        let p = prepare();
+        let fwd_idx = p.fwd_gpu_idx[0].unwrap();
+        let mut res = fake_gpu_result(p, 4, &[]);
+        res.cigar_ops[fwd_idx] = vec![OP_MATCH as i8; 11];
+        res.cigar_lengths[fwd_idx] = 11;
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
+        assert_eq!(out.rows, vec![vec!["r0", "refA", "10=", "+"]]);
+        assert_eq!((out.cpu_fallbacks, out.invalid_cigars), (1, 1));
+
+        // Spans right, but the ops do not cost what the score says.
+        let p = prepare();
+        let fwd_idx = p.fwd_gpu_idx[0].unwrap();
+        let mut res = fake_gpu_result(p, 4, &[]);
+        res.scores[fwd_idx] = 3;
+        let out = format_batch_rows(&res, &refs, &tags, 2, 1, 4, 0, false, false);
+        assert_eq!(out.rows, vec![vec!["r0", "refA", "10=", "+"]]);
+        assert_eq!((out.cpu_fallbacks, out.invalid_cigars), (1, 1));
+    }
+
     /// Cross-check the CPU aligner against the CUDA kernel compiled as host
     /// C++ (`tools/kernel_emulate.cpp`). Set `BLEP_KERNEL_EMULATION_TSV` to the
     /// harness output to enable; without it this test is a no-op.
+    ///
+    /// Agreement alone proves little (the two share their logic, and once
+    /// shared a backtrack bug), so every kernel CIGAR is also checked on its
+    /// own: a true alignment of the pair, costing exactly the kernel's score,
+    /// which is the Gotoh optimum.
     #[test]
     fn cpu_align_matches_kernel_emulation() {
         let Ok(path) = std::env::var("BLEP_KERNEL_EMULATION_TSV") else { return; };
@@ -2569,6 +2917,9 @@ mod tests {
             let got = cpu_align(q, r, go, ge, mm, max_k);
             if score >= 0 {
                 assert_eq!(got, Some((score, cigar.to_string())), "pair {} vs {}", f[0], f[1]);
+                assert_eq!(true_alignment_cost(cigar, q, r, go, ge, mm), Some(score),
+                           "kernel cigar {} is not a true alignment at score {}: {} vs {}", cigar, score, f[0], f[1]);
+                assert_eq!(gotoh_score(q, r, go, ge, mm), score, "kernel score not optimal: {} vs {}", f[0], f[1]);
             } else {
                 // The kernel gave up at max_score; the CPU (cap 4096) must not find a cheaper alignment.
                 assert!(got.as_ref().map_or(true, |(s, _)| *s > max_score),
